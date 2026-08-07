@@ -1,4 +1,5 @@
-import { User, Bell, Shield, Palette, Globe } from 'lucide-react';
+import Link from 'next/link';
+import { User, Bell, Shield, Palette, Globe, Mail, Plus, CheckCircle2, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -10,8 +11,49 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
+import { emailProviderOptions } from '@/lib/email/providers';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
-export default function ConfiguracoesPage() {
+function formatDate(value: string | null) {
+  if (!value) return 'Ainda não sincronizado';
+  return new Date(value).toLocaleString('pt-BR', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+}
+
+export default async function ConfiguracoesPage({
+  searchParams,
+}: {
+  searchParams?: Record<string, string | string[] | undefined>;
+}) {
+  const supabase = await createSupabaseServerClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  const { data: connectedAccounts } = user
+    ? await supabase
+        .from('connected_email_accounts')
+        .select('id, provider, email_address, display_name, status, created_at, updated_at, last_sync_at')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+    : { data: [] };
+
+  const statusMessage = searchParams?.microsoft;
+  const messageContent =
+    statusMessage === 'connected'
+      ? {
+          tone: 'success',
+          text: 'Conta Microsoft conectada com sucesso. Você já pode ver sua conta na lista abaixo.',
+        }
+      : statusMessage === 'error'
+        ? {
+            tone: 'error',
+            text: 'A autorização foi cancelada ou falhou. Tente novamente.',
+          }
+        : null;
+
   return (
     <div className="space-y-6">
       <div>
@@ -24,6 +66,92 @@ export default function ConfiguracoesPage() {
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
+        <Card className="border-border bg-card lg:col-span-2">
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Mail className="h-5 w-5 text-primary" />
+              <CardTitle className="text-base font-semibold text-foreground">
+                E-mails conectados
+              </CardTitle>
+            </div>
+            <CardDescription className="text-sm text-muted-foreground">
+              Conecte suas contas de e-mail para que o Omnia possa identificar mensagens, anexos, contas, documentos e compromissos automaticamente.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {messageContent ? (
+              <div className={`flex items-start gap-2 rounded-lg border p-3 ${messageContent.tone === 'success' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400' : 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400'}`}>
+                {messageContent.tone === 'success' ? <CheckCircle2 className="mt-0.5 h-4 w-4" /> : <AlertCircle className="mt-0.5 h-4 w-4" />}
+                <p className="text-sm">{messageContent.text}</p>
+              </div>
+            ) : null}
+
+            {connectedAccounts && connectedAccounts.length > 0 ? (
+              <div className="space-y-2">
+                {connectedAccounts.map((account) => (
+                  <div key={account.id} className="flex flex-col gap-2 rounded-lg border border-border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <p className="text-sm font-medium text-foreground">{account.email_address}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {account.display_name || 'Conta Microsoft'} • {account.provider}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Status: <span className="font-medium text-foreground">{account.status}</span> • Última sincronização: {formatDate(account.last_sync_at)}
+                      </p>
+                    </div>
+                    <div className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                      Conectado
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-dashed border-border bg-secondary/40 p-4">
+                <div>
+                  <p className="text-sm font-medium text-foreground">Nenhuma conta de e-mail conectada.</p>
+                  <p className="text-sm text-muted-foreground">
+                    Conecte sua conta Microsoft para permitir a leitura de e-mails e anexos no Omnia.
+                  </p>
+                </div>
+                <Button asChild type="button" variant="outline" className="border-border text-foreground hover:bg-secondary">
+                  <Link href="/api/integrations/microsoft/connect">
+                    <Plus className="mr-2 h-4 w-4" />
+                    Conectar Microsoft
+                  </Link>
+                </Button>
+              </div>
+            )}
+
+            <div className="rounded-lg border border-border bg-background/70 p-4">
+              <p className="mb-3 text-sm font-medium text-foreground">Provedores disponíveis</p>
+              <div className="grid gap-3 md:grid-cols-2">
+                {emailProviderOptions.map((option) => (
+                  <div key={option.id} className="rounded-lg border border-border bg-card p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{option.label}</p>
+                        <p className="text-xs text-muted-foreground">{option.description}</p>
+                      </div>
+                      {option.provider === 'microsoft' ? (
+                        <Button asChild type="button" variant="ghost" size="sm" className="text-primary">
+                          <Link href="/api/integrations/microsoft/connect">Conectar</Link>
+                        </Button>
+                      ) : (
+                        <Button type="button" variant="ghost" size="sm" className="text-muted-foreground" disabled>
+                          Em breve
+                        </Button>
+                      )}
+                    </div>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Suporta Outlook, Hotmail, Microsoft 365 e contas pessoais ou corporativas da Microsoft.
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
         <Card className="border-border bg-card">
           <CardHeader>
             <div className="flex items-center gap-2">
