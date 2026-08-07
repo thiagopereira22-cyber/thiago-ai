@@ -1274,6 +1274,9 @@ video {
 .border-\[--color-border\] {
   border-color: var(--color-border);
 }
+.border-amber-500\/30 {
+  border-color: rgb(245 158 11 / 0.3);
+}
 .border-border {
   border-color: hsl(var(--border));
 }
@@ -1318,6 +1321,9 @@ video {
 }
 .bg-accent {
   background-color: hsl(var(--accent));
+}
+.bg-amber-500\/10 {
+  background-color: rgb(245 158 11 / 0.1);
 }
 .bg-background {
   background-color: hsl(var(--background));
@@ -1600,6 +1606,10 @@ video {
 .text-amber-400 {
   --tw-text-opacity: 1;
   color: rgb(251 191 36 / var(--tw-text-opacity));
+}
+.text-amber-500 {
+  --tw-text-opacity: 1;
+  color: rgb(245 158 11 / var(--tw-text-opacity));
 }
 .text-card-foreground {
   color: hsl(var(--card-foreground));
