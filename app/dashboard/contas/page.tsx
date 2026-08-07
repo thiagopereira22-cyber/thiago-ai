@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { Plus, Wallet } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { CheckCircle2, Pencil, Plus, Search, Trash2, Wallet } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Toaster } from '@/components/ui/toaster';
 import {
   Card,
   CardContent,
@@ -20,6 +21,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useToast } from '@/hooks/use-toast';
 import { createSupabaseBrowserClient } from '@/lib/supabase-browser';
 
 type BillRecord = {
@@ -81,14 +83,124 @@ function formatDate(value: unknown) {
   }).format(date);
 }
 
+function isBillPending(bill: BillRecord) {
+  return (bill.status ?? 'Pendente') !== 'Pago';
+}
+
+function isBillPaid(bill: BillRecord) {
+  return (bill.status ?? 'Pendente') === 'Pago';
+}
+
+function getDateKey(value: unknown) {
+  if (!value) {
+    return null;
+  }
+
+  const rawValue = String(value);
+  const normalizedValue = rawValue.includes('T') ? rawValue.split('T')[0] : rawValue;
+  const [year, month, day] = normalizedValue.split('-').map((part) => Number(part));
+
+  if (!year || !month || !day) {
+    return null;
+  }
+
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function isDueToday(bill: BillRecord) {
+  if (!bill.due_date) {
+    return false;
+  }
+
+  const today = new Date();
+  const todayValue = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const dueDateValue = getDateKey(bill.due_date);
+
+  return dueDateValue === todayValue;
+}
+
+function isDueTomorrow(bill: BillRecord) {
+  if (!bill.due_date) {
+    return false;
+  }
+
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowValue = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
+  const dueDateValue = getDateKey(bill.due_date);
+
+  return dueDateValue === tomorrowValue;
+}
+
+function isBillOverdue(bill: BillRecord) {
+  if ((bill.status ?? 'Pendente') === 'Pago') {
+    return false;
+  }
+
+  if (!bill.due_date) {
+    return false;
+  }
+
+  const today = new Date();
+  const todayValue = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const dueDateValue = getDateKey(bill.due_date);
+
+  if (!dueDateValue) {
+    return false;
+  }
+
+  return dueDateValue < todayValue;
+}
+
+function getBillDueStatus(bill: BillRecord) {
+  if ((bill.status ?? 'Pendente') === 'Pago') {
+    return 'paid';
+  }
+
+  if (isBillOverdue(bill)) {
+    return 'overdue';
+  }
+
+  if (isDueToday(bill)) {
+    return 'due_today';
+  }
+
+  if (isDueTomorrow(bill)) {
+    return 'due_tomorrow';
+  }
+
+  return 'pending';
+}
+
+function getBillDueDateTimestamp(bill: BillRecord) {
+  if (!bill.due_date) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const value = Date.parse(String(bill.due_date));
+  return Number.isNaN(value) ? Number.POSITIVE_INFINITY : value;
+}
+
+function getBillAmountValue(bill: BillRecord) {
+  const amount = Number(bill.amount ?? 0);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
 export default function ContasPage() {
   const [bills, setBills] = useState<BillRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [activeFilter, setActiveFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sortOrder, setSortOrder] = useState<'closest_due' | 'farthest_due' | 'highest_amount' | 'lowest_amount'>('closest_due');
+  const [editingBillId, setEditingBillId] = useState<string | null>(null);
+  const [billToDelete, setBillToDelete] = useState<BillRecord | null>(null);
   const [form, setForm] = useState<BillFormState>(initialFormState);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const { toast } = useToast();
 
   useEffect(() => {
     void fetchBills();
@@ -114,9 +226,50 @@ export default function ContasPage() {
     setIsLoading(false);
   }
 
+  function resetForm() {
+    setForm(initialFormState);
+    setEditingBillId(null);
+    setFormError(null);
+  }
+
+  function handleOpenCreateModal() {
+    resetForm();
+    setIsModalOpen(true);
+  }
+
+  function clearFilters() {
+    setSearchTerm('');
+    setActiveFilter('all');
+    setSortOrder('closest_due');
+  }
+
+  function handleOpenEditModal(bill: BillRecord) {
+    setEditingBillId(bill.id ?? null);
+    setForm({
+      title: bill.title ?? '',
+      supplier: bill.supplier ?? '',
+      amount: String(bill.amount ?? ''),
+      dueDate: bill.due_date ?? '',
+      status: bill.status ?? 'Pendente',
+    });
+    setFormError(null);
+    setIsModalOpen(true);
+  }
+
+  function handleModalOpenChange(open: boolean) {
+    setIsModalOpen(open);
+    if (!open) {
+      resetForm();
+    }
+  }
+
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
+
+    if (isSubmitting) {
+      return;
+    }
 
     if (!form.title.trim()) {
       setFormError('O título é obrigatório.');
@@ -128,6 +281,12 @@ export default function ContasPage() {
       return;
     }
 
+    const amountValue = Number(form.amount);
+    if (!Number.isFinite(amountValue) || amountValue <= 0) {
+      setFormError('O valor deve ser maior que zero.');
+      return;
+    }
+
     if (!form.dueDate) {
       setFormError('A data de vencimento é obrigatória.');
       return;
@@ -136,27 +295,202 @@ export default function ContasPage() {
     const supabase = createSupabaseBrowserClient();
     setIsSubmitting(true);
 
-    const { error: insertError } = await supabase.from('bills').insert([
-      {
-        title: form.title.trim(),
-        supplier: form.supplier.trim() || null,
-        amount: Number(form.amount),
-        due_date: form.dueDate,
-        status: form.status,
-      },
-    ]);
+    if (editingBillId) {
+      const { error: updateError } = await supabase
+        .from('bills')
+        .update({
+          title: form.title.trim(),
+          supplier: form.supplier.trim() || null,
+          amount: Number(form.amount),
+          due_date: form.dueDate,
+          status: form.status,
+        })
+        .eq('id', editingBillId);
 
-    if (insertError) {
-      setFormError('Não foi possível salvar a conta.');
+      if (updateError) {
+        setFormError('Não foi possível atualizar a conta.');
+        setIsSubmitting(false);
+        return;
+      }
+    } else {
+      const { error: insertError } = await supabase.from('bills').insert([
+        {
+          title: form.title.trim(),
+          supplier: form.supplier.trim() || null,
+          amount: Number(form.amount),
+          due_date: form.dueDate,
+          status: form.status,
+        },
+      ]);
+
+      if (insertError) {
+        setFormError('Não foi possível salvar a conta.');
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    setIsSubmitting(false);
+    setIsModalOpen(false);
+    resetForm();
+    await fetchBills();
+
+    toast({
+      title: editingBillId ? 'Conta editada' : 'Conta criada',
+      description: editingBillId
+        ? 'Os dados da conta foram atualizados com sucesso.'
+        : 'A nova conta foi criada com sucesso.',
+    });
+  }
+
+  async function handleMarkAsPaid(billId?: string) {
+    if (!billId) {
+      return;
+    }
+
+    const supabase = createSupabaseBrowserClient();
+    setIsSubmitting(true);
+    setError(null);
+
+    const { error: updateError } = await supabase
+      .from('bills')
+      .update({ status: 'Pago' })
+      .eq('id', billId);
+
+    if (updateError) {
+      setError('Não foi possível atualizar o status da conta.');
       setIsSubmitting(false);
       return;
     }
 
     setIsSubmitting(false);
-    setIsModalOpen(false);
-    setForm(initialFormState);
     await fetchBills();
+
+    toast({
+      title: 'Conta marcada como paga',
+      description: 'A conta foi atualizada para o status Pago.',
+    });
   }
+
+  function handleOpenDeleteModal(bill: BillRecord) {
+    setBillToDelete(bill);
+    setIsDeleteModalOpen(true);
+  }
+
+  async function handleDeleteConfirm() {
+    if (!billToDelete?.id) {
+      return;
+    }
+
+    const supabase = createSupabaseBrowserClient();
+    setIsSubmitting(true);
+    setError(null);
+
+    const { error: deleteError } = await supabase
+      .from('bills')
+      .delete()
+      .eq('id', billToDelete.id);
+
+    if (deleteError) {
+      setError('Não foi possível excluir a conta.');
+      setIsSubmitting(false);
+      return;
+    }
+
+    setIsSubmitting(false);
+    setIsDeleteModalOpen(false);
+    setBillToDelete(null);
+    await fetchBills();
+
+    toast({
+      title: 'Conta excluída',
+      description: 'A conta foi removida com sucesso.',
+    });
+  }
+
+  const filteredBills = useMemo(() => {
+    const normalizedSearch = searchTerm.trim().toLowerCase();
+
+    const filtered = bills.filter((bill) => {
+      const status = bill.status ?? 'Sem status';
+      const isOverdueBill = isBillOverdue(bill);
+      const matchesFilter =
+        activeFilter === 'pending'
+          ? status !== 'Pago'
+          : activeFilter === 'overdue'
+            ? isOverdueBill
+            : activeFilter === 'paid'
+              ? status === 'Pago'
+              : true;
+
+      if (!normalizedSearch) {
+        return matchesFilter;
+      }
+
+      const title = (bill.title ?? '').toLowerCase();
+      const supplier = (bill.supplier ?? '').toLowerCase();
+      const matchesSearch = title.includes(normalizedSearch) || supplier.includes(normalizedSearch);
+
+      return matchesFilter && matchesSearch;
+    });
+
+    const sorted = [...filtered].sort((a, b) => {
+      if (sortOrder === 'highest_amount') {
+        return getBillAmountValue(b) - getBillAmountValue(a);
+      }
+
+      if (sortOrder === 'lowest_amount') {
+        return getBillAmountValue(a) - getBillAmountValue(b);
+      }
+
+      const aDueDate = getBillDueDateTimestamp(a);
+      const bDueDate = getBillDueDateTimestamp(b);
+
+      if (aDueDate === Number.POSITIVE_INFINITY && bDueDate === Number.POSITIVE_INFINITY) {
+        return 0;
+      }
+
+      if (aDueDate === Number.POSITIVE_INFINITY) {
+        return 1;
+      }
+
+      if (bDueDate === Number.POSITIVE_INFINITY) {
+        return -1;
+      }
+
+      if (sortOrder === 'farthest_due') {
+        return bDueDate - aDueDate;
+      }
+
+      return aDueDate - bDueDate;
+    });
+
+    return sorted;
+  }, [activeFilter, bills, searchTerm, sortOrder]);
+
+  const metrics = useMemo(() => {
+    const pendingBills = bills.filter(isBillPending);
+    const paidBills = bills.filter(isBillPaid);
+    const overdueBills = bills.filter(isBillOverdue);
+    const dueTodayBills = bills.filter(isDueToday);
+    const totalPending = pendingBills.reduce((sum, bill) => sum + getBillAmountValue(bill), 0);
+    const totalOverdue = overdueBills.reduce((sum, bill) => sum + getBillAmountValue(bill), 0);
+    const totalPaid = paidBills.reduce((sum, bill) => sum + getBillAmountValue(bill), 0);
+    const totalToPay = pendingBills.reduce((sum, bill) => sum + getBillAmountValue(bill), 0);
+
+    return {
+      pendingCount: pendingBills.length,
+      overdueCount: overdueBills.length,
+      paidCount: paidBills.length,
+      dueTodayCount: dueTodayBills.length,
+      totalPending,
+      totalOverdue,
+      totalPaid,
+      totalToPay,
+    };
+  }, [bills]);
+
+  const hasActiveFilters = searchTerm.trim() !== '' || activeFilter !== 'all' || sortOrder !== 'closest_due';
 
   return (
     <div className="space-y-6">
@@ -171,12 +505,183 @@ export default function ContasPage() {
         </div>
         <Button
           className="bg-primary text-primary-foreground hover:bg-primary/90"
-          onClick={() => setIsModalOpen(true)}
+          onClick={handleOpenCreateModal}
         >
           <Plus className="mr-2 h-4 w-4" />
           Nova Conta
         </Button>
       </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        <Card className="border-border bg-card">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Pendentes
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-foreground">
+              {metrics.pendingCount}
+            </div>
+            <p className="text-sm text-muted-foreground">Contas ainda não pagas</p>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Vencidas
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-foreground">
+              {metrics.overdueCount}
+            </div>
+            <p className="text-sm text-muted-foreground">Contas pendentes vencidas</p>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Pagas
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-foreground">
+              {metrics.paidCount}
+            </div>
+            <p className="text-sm text-muted-foreground">Contas quitadas</p>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Vencem Hoje
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-foreground">
+              {metrics.dueTodayCount}
+            </div>
+            <p className="text-sm text-muted-foreground">Contas com vencimento para hoje</p>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Total a Pagar
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-foreground">
+              {formatCurrency(metrics.totalToPay)}
+            </div>
+            <p className="text-sm text-muted-foreground">Soma dos valores pendentes</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <Button
+          type="button"
+          variant={activeFilter === 'all' ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => setActiveFilter('all')}
+        >
+          Todas
+        </Button>
+        <Button
+          type="button"
+          variant={activeFilter === 'pending' ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => setActiveFilter('pending')}
+        >
+          Pendentes
+        </Button>
+        <Button
+          type="button"
+          variant={activeFilter === 'overdue' ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => setActiveFilter('overdue')}
+        >
+          Vencidas
+        </Button>
+        <Button
+          type="button"
+          variant={activeFilter === 'paid' ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => setActiveFilter('paid')}
+        >
+          Pagas
+        </Button>
+      </div>
+
+      <div className="flex flex-col gap-3 md:flex-row md:items-end">
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            type="search"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder="Buscar por título ou fornecedor..."
+            className="pl-9"
+          />
+        </div>
+
+        <div className="w-full space-y-2 md:w-56">
+          <Label htmlFor="sort-by">Ordenar por</Label>
+          <select
+            id="sort-by"
+            value={sortOrder}
+            onChange={(event) => setSortOrder(event.target.value as typeof sortOrder)}
+            className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+          >
+            <option value="closest_due">Vencimento mais próximo</option>
+            <option value="farthest_due">Vencimento mais distante</option>
+            <option value="highest_amount">Maior valor</option>
+            <option value="lowest_amount">Menor valor</option>
+          </select>
+        </div>
+      </div>
+
+      {hasActiveFilters ? (
+        <div className="flex justify-start">
+          <Button type="button" variant="ghost" size="sm" onClick={clearFilters}>
+            Limpar filtros
+          </Button>
+        </div>
+      ) : null}
+
+      <Card className="border-border bg-card">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium text-muted-foreground">Resumo</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border border-border/60 bg-background/60 p-3">
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Total pendente</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">
+                {formatCurrency(metrics.totalPending)}
+              </p>
+            </div>
+            <div className="rounded-lg border border-border/60 bg-background/60 p-3">
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Total vencido</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">
+                {formatCurrency(metrics.totalOverdue)}
+              </p>
+            </div>
+            <div className="rounded-lg border border-border/60 bg-background/60 p-3">
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Total pago</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">
+                {formatCurrency(metrics.totalPaid)}
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       {error ? (
         <div className="rounded-lg border border-border bg-card p-6 text-sm text-muted-foreground">
@@ -186,25 +691,49 @@ export default function ContasPage() {
         <div className="rounded-lg border border-border bg-card p-6 text-sm text-muted-foreground">
           Carregando contas...
         </div>
-      ) : bills.length === 0 ? (
-        <div className="rounded-lg border border-border bg-card p-6 text-sm text-muted-foreground">
-          Nenhuma conta encontrada.
+      ) : filteredBills.length === 0 ? (
+        <div className="rounded-xl border border-border bg-card p-8 text-center">
+          <h3 className="text-lg font-semibold text-foreground">
+            {bills.length === 0 ? 'Você ainda não possui contas cadastradas.' : 'Nenhuma conta encontrada.'}
+          </h3>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {bills.length === 0
+              ? 'Cadastre sua primeira conta para começar a organizar seus pagamentos.'
+              : 'Tente ajustar a pesquisa, os filtros ou a ordenação.'}
+          </p>
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            {bills.length > 0 ? (
+              <Button type="button" variant="outline" onClick={clearFilters}>
+                Limpar filtros
+              </Button>
+            ) : null}
+            <Button type="button" onClick={handleOpenCreateModal}>
+              + Nova Conta
+            </Button>
+          </div>
         </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {bills.map((bill) => {
+          {filteredBills.map((bill) => {
             const title = bill.title ?? 'Conta sem título';
             const supplier = bill.supplier ?? '—';
             const value = bill.amount ?? 0;
             const dueDate = bill.due_date ?? null;
             const status = bill.status ?? 'Sem status';
+            const isPaid = status === 'Pago';
+            const dueStatus = getBillDueStatus(bill);
+            const displayStatus = dueStatus === 'overdue' ? 'Vencida' : dueStatus === 'due_today' ? 'Vence hoje' : dueStatus === 'due_tomorrow' ? 'Vence amanhã' : status;
+            const isOverdue = dueStatus === 'overdue';
+            const cardClasses = isOverdue
+              ? 'border-red-500/40 bg-red-500/10 shadow-sm'
+              : 'border-border bg-card';
 
             return (
-              <Card key={bill.id ?? title} className="border-border bg-card">
+              <Card key={bill.id ?? title} className={cardClasses}>
                 <CardHeader>
                   <div className="flex items-center justify-between">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-                      <Wallet className="h-5 w-5 text-primary" />
+                    <div className={`flex h-10 w-10 items-center justify-center rounded-lg ${isOverdue ? 'bg-red-500/15' : 'bg-primary/10'}`}>
+                      <Wallet className={`h-5 w-5 ${isOverdue ? 'text-red-500' : 'text-primary'}`} />
                     </div>
                   </div>
                   <CardTitle className="text-base font-semibold text-foreground">
@@ -225,8 +754,44 @@ export default function ContasPage() {
                     </p>
                     <p>
                       <span className="font-medium text-foreground">Status:</span>{' '}
-                      {status}
+                      <span className={isOverdue ? 'font-semibold text-red-500' : 'font-medium text-foreground'}>
+                        {displayStatus}
+                      </span>
                     </p>
+                  </div>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="flex-1"
+                      onClick={() => handleOpenEditModal(bill)}
+                    >
+                      <Pencil className="mr-2 h-4 w-4" />
+                      Editar
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="flex-1"
+                      onClick={() => void handleMarkAsPaid(bill.id)}
+                      disabled={isSubmitting || isPaid}
+                    >
+                      <CheckCircle2 className="mr-2 h-4 w-4" />
+                      {isPaid ? 'Conta paga' : 'Marcar como paga'}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="sm"
+                      className="flex-1"
+                      onClick={() => handleOpenDeleteModal(bill)}
+                      disabled={isSubmitting}
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Excluir
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
@@ -235,12 +800,14 @@ export default function ContasPage() {
         </div>
       )}
 
-      <Dialog open={isModalOpen} onOpenChange={setIsModalOpen}>
-        <DialogContent className="sm:max-w-[500px]">
+      <Dialog open={isModalOpen} onOpenChange={handleModalOpenChange}>
+        <DialogContent className="w-[calc(100%-1rem)] max-w-[500px]">
           <DialogHeader>
-            <DialogTitle>Nova conta</DialogTitle>
+            <DialogTitle>{editingBillId ? 'Editar conta' : 'Nova conta'}</DialogTitle>
             <DialogDescription>
-              Preencha os dados da conta abaixo.
+              {editingBillId
+                ? 'Atualize os dados da conta selecionada.'
+                : 'Preencha os dados da conta abaixo.'}
             </DialogDescription>
           </DialogHeader>
 
@@ -326,7 +893,7 @@ export default function ContasPage() {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => setIsModalOpen(false)}
+                onClick={() => handleModalOpenChange(false)}
                 disabled={isSubmitting}
               >
                 Cancelar
@@ -338,6 +905,40 @@ export default function ContasPage() {
           </form>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={isDeleteModalOpen} onOpenChange={setIsDeleteModalOpen}>
+        <DialogContent className="w-[calc(100%-1rem)] max-w-[425px]">
+          <DialogHeader>
+            <DialogTitle>Excluir conta</DialogTitle>
+            <DialogDescription>
+              Tem certeza que deseja excluir esta conta?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="pt-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setIsDeleteModalOpen(false);
+                setBillToDelete(null);
+              }}
+              disabled={isSubmitting}
+            >
+              Cancelar
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => void handleDeleteConfirm()}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Excluindo...' : 'Excluir'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Toaster />
     </div>
   );
 }
