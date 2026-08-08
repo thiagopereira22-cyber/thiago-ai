@@ -1,0 +1,744 @@
+import { NextResponse } from 'next/server';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
+import { getValidMicrosoftAccessToken } from '@/lib/integrations/microsoft';
+
+type GraphMessage = {
+  id: string;
+  subject?: string | null;
+  bodyPreview?: string | null;
+  receivedDateTime?: string | null;
+  hasAttachments?: boolean;
+  body?: {
+    contentType?: string | null;
+    content?: string | null;
+  };
+  from?: {
+    emailAddress?: {
+      name?: string | null;
+      address?: string | null;
+    };
+  };
+};
+
+type GraphMessagesResponse = {
+  value?: GraphMessage[];
+  '@odata.nextLink'?: string;
+};
+
+type IncompleteCandidate = {
+  account: string;
+  subject: string;
+  supplier: string;
+  amount: number | null;
+  dueDate: string | null;
+  hasAttachments: boolean;
+};
+
+const STRONG_FINANCIAL_TERMS = [
+  'boleto',
+  'fatura disponível',
+  'fatura disponivel',
+  'sua fatura',
+  'valor da fatura',
+  'valor a pagar',
+  'conta disponível',
+  'conta disponivel',
+  'conta para pagamento',
+  'vencimento',
+  'vence em',
+  'segunda via',
+  'linha digitável',
+  'linha digitavel',
+  'código de barras',
+  'codigo de barras',
+  'pix copia e cola',
+  'pix copia e cole',
+  'cobrança',
+  'cobranca',
+  'mensalidade',
+];
+
+const WEAK_FINANCIAL_TERMS = [
+  'pagamento',
+  'conta',
+  'fatura',
+  'boleto',
+  'vencimento',
+];
+
+const PROMOTIONAL_TERMS = [
+  'promoção',
+  'promocao',
+  'desconto',
+  'cupom',
+  'oferta',
+  'liquidação',
+  'liquidacao',
+  '% off',
+  'investimento',
+  'investir',
+  'rendimento',
+  'cdi',
+  'cashback',
+  'ganhe',
+  'compre',
+  'imperdível',
+  'imperdivel',
+  'aproveite',
+];
+
+function normalizeText(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function countTerms(text: string, terms: string[]) {
+  const normalized = normalizeText(text);
+
+  return terms.filter((term) =>
+    normalized.includes(normalizeText(term))
+  ).length;
+}
+
+function isLikelyFinancial(message: GraphMessage) {
+  const text = [
+    message.subject,
+    message.bodyPreview,
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const strongScore = countTerms(text, STRONG_FINANCIAL_TERMS);
+  const weakScore = countTerms(text, WEAK_FINANCIAL_TERMS);
+  const promotionalScore = countTerms(text, PROMOTIONAL_TERMS);
+
+  if (promotionalScore > 0 && strongScore === 0) {
+    return false;
+  }
+
+  return strongScore > 0 || weakScore >= 2;
+}
+
+function isConfirmedFinancialText(text: string) {
+  const strongScore = countTerms(text, STRONG_FINANCIAL_TERMS);
+  const promotionalScore = countTerms(text, PROMOTIONAL_TERMS);
+
+  return strongScore > promotionalScore;
+}
+
+function extractAmount(text: string): number | null {
+  const patterns = [
+    /(?:valor(?:\s+total|\s+da\s+fatura|\s+a\s+pagar)?|total(?:\s+a\s+pagar)?|pagar|pagamento|fatura)\s*:?\s*R?\$?\s*([\d.]+,\d{2})/i,
+    /R\$\s*([\d.]+,\d{2})/i,
+    /\d{1,2}\/\d{1,2}\/\d{2,4}\s+([\d.]+,\d{2})(?:\s|$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+
+    if (!match?.[1]) {
+      continue;
+    }
+
+    const normalized = match[1]
+      .replace(/\./g, '')
+      .replace(',', '.');
+
+    const amount = Number(normalized);
+
+    if (Number.isFinite(amount) && amount > 0) {
+      return amount;
+    }
+  }
+
+  return null;
+}
+
+function toIsoDate(day: string, month: string, year: string) {
+  let normalizedYear = Number(year);
+
+  if (normalizedYear < 100) {
+    normalizedYear += 2000;
+  }
+
+  const normalizedMonth = Number(month);
+  const normalizedDay = Number(day);
+
+  const date = new Date(
+    Date.UTC(
+      normalizedYear,
+      normalizedMonth - 1,
+      normalizedDay
+    )
+  );
+
+  if (
+    date.getUTCFullYear() !== normalizedYear ||
+    date.getUTCMonth() !== normalizedMonth - 1 ||
+    date.getUTCDate() !== normalizedDay
+  ) {
+    return null;
+  }
+
+  return `${String(normalizedYear).padStart(4, '0')}-${String(
+    normalizedMonth
+  ).padStart(2, '0')}-${String(normalizedDay).padStart(2, '0')}`;
+}
+
+function extractDueDate(text: string): string | null {
+  const patterns = [
+    /(?:vencimento|vence|venc(?:\.|imento)?)\s*(?:em|:)?\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/i,
+    /(?:até|ate)\s+(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/i,
+    /(?:vencimento\s+valor\s+(?:link\s+)?)(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+
+    if (!match) {
+      continue;
+    }
+
+    const isoDate = toIsoDate(
+      match[1],
+      match[2],
+      match[3]
+    );
+
+    if (isoDate) {
+      return isoDate;
+    }
+  }
+
+  return null;
+}
+
+function extractPaymentCode(text: string): string | null {
+  const candidates =
+    text.match(/(?:\d[\s.-]?){44,48}/g) || [];
+
+  for (const candidate of candidates) {
+    const digits = candidate.replace(/\D/g, '');
+
+    if (digits.length >= 44 && digits.length <= 48) {
+      return digits;
+    }
+  }
+
+  return null;
+}
+
+function buildTitle(message: GraphMessage) {
+  let subject = message.subject?.trim();
+
+  if (!subject) {
+    return 'Conta detectada por e-mail';
+  }
+
+  subject = subject
+    // Remove encaminhamento/resposta do Outlook.
+    .replace(/^(?:(?:fw|fwd|re)\s*:\s*)+/gi, '')
+
+    // Remove termos genéricos de cobrança no início.
+    .replace(
+      /^(?:boleto\s*\/\s*fatura|fatura\s*\/\s*boleto|boleto|fatura)\s*[:\-–—]?\s*/i,
+      ''
+    )
+
+    // Remove expressões genéricas.
+    .replace(/^sua\s+fatura(?:\s+digital)?\s*/i, '')
+    .replace(/\s+(?:chegou|disponível|disponivel)!*$/i, '')
+
+    // Limpeza final.
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  if (!subject) {
+    return 'Conta detectada por e-mail';
+  }
+
+  return subject.slice(0, 180);
+}
+
+function extractPaymentUrl(text: string): string | null {
+  const links = Array.from(
+    text.matchAll(/<((?:https?:\/\/)[^>\s]+)>/gi)
+  ).map((match) => match[1]);
+
+  for (const link of links) {
+    const normalized = link.toLowerCase();
+
+    if (
+      normalized.includes('safelinks.protection.outlook.com') &&
+      (
+        normalized.includes('boleto') ||
+        normalized.includes('fatura')
+      )
+    ) {
+      return link;
+    }
+  }
+
+  for (const link of links) {
+    const normalized = link.toLowerCase();
+
+    if (
+      normalized.includes('boleto') ||
+      normalized.includes('fatura')
+    ) {
+      return link;
+    }
+  }
+
+  return null;
+}
+
+async function parseJsonResponse<T>(
+  response: Response,
+  errorMessage: string
+): Promise<T> {
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `${errorMessage} HTTP ${response.status}`
+    );
+  }
+
+  if (!responseText) {
+    throw new Error(errorMessage);
+  }
+
+  try {
+    return JSON.parse(responseText) as T;
+  } catch {
+    throw new Error(
+      `${errorMessage} Resposta inválida da Microsoft.`
+    );
+  }
+}
+
+async function fetchFullMessage(
+  messageId: string,
+  accessToken: string
+): Promise<GraphMessage> {
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(
+      messageId
+    )}`
+  );
+
+  url.searchParams.set(
+    '$select',
+    'id,subject,from,receivedDateTime,bodyPreview,body,hasAttachments'
+  );
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+      Prefer: 'outlook.body-content-type="text"',
+    },
+    cache: 'no-store',
+  });
+
+  return parseJsonResponse<GraphMessage>(
+    response,
+    'Não foi possível carregar o conteúdo completo do e-mail.'
+  );
+}
+
+async function fetchRecentMessages(
+  accessToken: string,
+  _lastSyncAt: string | null
+) {
+  const url = new URL(
+    'https://graph.microsoft.com/v1.0/me/messages'
+  );
+
+  url.searchParams.set('$top', '100');
+
+  url.searchParams.set(
+    '$select',
+    'id,subject,from,receivedDateTime,bodyPreview,hasAttachments'
+  );
+
+  url.searchParams.set(
+    '$orderby',
+    'receivedDateTime desc'
+  );
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload =
+    await parseJsonResponse<GraphMessagesResponse>(
+      response,
+      'Não foi possível consultar os e-mails Microsoft.'
+    );
+
+  return payload.value || [];
+}
+
+export async function POST() {
+  try {
+    const supabase =
+      await createSupabaseServerClient();
+
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser();
+
+    if (authError || !user) {
+      return NextResponse.json(
+        { error: 'Usuário não autenticado.' },
+        { status: 401 }
+      );
+    }
+
+    const {
+      data: profile,
+      error: profileError,
+    } = await supabase
+      .from('profiles')
+      .select('company_id')
+      .eq('id', user.id)
+      .single();
+
+    if (
+      profileError ||
+      !profile?.company_id
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Empresa do usuário não encontrada.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const companyId = profile.company_id;
+
+    const {
+      data: accounts,
+      error: accountsError,
+    } = await supabase
+      .from('connected_email_accounts')
+      .select(
+        'id,email_address,provider,status,last_sync_at'
+      )
+      .eq('user_id', user.id)
+      .eq('provider', 'microsoft')
+      .eq('status', 'connected');
+
+    if (accountsError) {
+      return NextResponse.json(
+        {
+          error:
+            'Não foi possível consultar as contas Microsoft conectadas.',
+        },
+        { status: 500 }
+      );
+    }
+
+    if (!accounts?.length) {
+      return NextResponse.json(
+        {
+          error:
+            'Nenhuma conta Microsoft conectada.',
+        },
+        { status: 404 }
+      );
+    }
+
+    let scanned = 0;
+    let detected = 0;
+    let created = 0;
+    let duplicates = 0;
+    let incomplete = 0;
+    let attachmentPending = 0;
+
+    const incompleteMessages: IncompleteCandidate[] =
+      [];
+
+    for (const account of accounts) {
+      let accessToken: string;
+
+      try {
+        accessToken =
+          await getValidMicrosoftAccessToken(
+            supabase,
+            user.id,
+            account.id
+          );
+      } catch {
+        continue;
+      }
+
+      let messages: GraphMessage[];
+
+      try {
+        messages = await fetchRecentMessages(
+          accessToken,
+          account.last_sync_at || null
+        );
+      } catch (error) {
+        console.error(
+          'Erro ao consultar mensagens Microsoft:',
+          error instanceof Error
+            ? error.message
+            : 'Erro desconhecido'
+        );
+
+        continue;
+      }
+
+      scanned += messages.length;
+
+      for (const message of messages) {
+        if (
+          !message.id ||
+          !isLikelyFinancial(message)
+        ) {
+          continue;
+        }
+
+        detected += 1;
+
+        const { data: existing } =
+          await supabase
+            .from('bills')
+            .select('id')
+            .eq(
+              'source_account_id',
+              account.id
+            )
+            .eq(
+              'source_message_id',
+              message.id
+            )
+            .maybeSingle();
+
+        
+        let fullMessage: GraphMessage;
+
+        try {
+          fullMessage =
+            await fetchFullMessage(
+              message.id,
+              accessToken
+            );
+        } catch {
+          incomplete += 1;
+          continue;
+        }
+
+        const fullText = [
+          fullMessage.subject,
+          fullMessage.bodyPreview,
+          fullMessage.body?.content,
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+if (
+  fullMessage.subject?.includes(
+    'CONDOMINIO RESIDENCIAL ALDEPARK'
+  )
+) {
+  console.log('=== EMAIL ALDEPARK ===');
+  console.log('ASSUNTO:', fullMessage.subject);
+  console.log('BODY PREVIEW:', fullMessage.bodyPreview);
+  console.log('BODY CONTENT:', fullMessage.body?.content);
+  console.log('FULL TEXT:', fullText);
+  console.log('=== FIM EMAIL ALDEPARK ===');
+}
+          
+        if (
+          !isConfirmedFinancialText(
+            fullText
+          )
+        ) {
+          continue;
+        }
+
+        const amount =
+          extractAmount(fullText);
+
+        const dueDate =
+          extractDueDate(fullText);
+
+        const supplier =
+          fullMessage.from?.emailAddress?.name?.trim() ||
+          fullMessage.from?.emailAddress?.address?.trim() ||
+          null;
+
+        const paymentCode =
+          extractPaymentCode(fullText);
+
+const paymentUrl =
+  extractPaymentUrl(fullText);
+
+if (existing) {
+  const updates: {
+    payment_url?: string;
+    payment_code?: string;
+  } = {};
+
+  if (paymentUrl) {
+    updates.payment_url = paymentUrl;
+  }
+
+  if (paymentCode) {
+    updates.payment_code = paymentCode;
+  }
+
+  if (Object.keys(updates).length > 0) {
+    const { error: updateExistingError } = await supabase
+      .from('bills')
+      .update(updates)
+      .eq('id', existing.id);
+
+    if (updateExistingError) {
+      console.error(
+        'Erro ao completar dados da conta existente:',
+        updateExistingError.message
+      );
+    }
+  }
+
+  duplicates += 1;
+  continue;
+}
+
+        if (!amount || !dueDate) {
+          incomplete += 1;
+
+          if (
+            fullMessage.hasAttachments
+          ) {
+            attachmentPending += 1;
+          }
+
+          incompleteMessages.push({
+            account:
+              account.email_address,
+            subject:
+              fullMessage.subject ||
+              'Sem assunto',
+            supplier:
+              supplier ||
+              'Desconhecido',
+            amount,
+            dueDate,
+            hasAttachments:
+              Boolean(
+                fullMessage.hasAttachments
+              ),
+          });
+
+          continue;
+        }
+
+        const { error: insertError } =
+          await supabase
+            .from('bills')
+            .insert({
+              company_id: companyId,
+              title:
+                buildTitle(
+                  fullMessage
+                ),
+              supplier,
+              amount,
+              due_date: dueDate,
+              status: 'Pendente',
+              source:
+                'microsoft_email',
+              source_message_id:
+                fullMessage.id,
+              source_account_id:
+                account.id,
+              payment_code:
+                paymentCode,
+              payment_url:
+                paymentUrl,
+              detected_at:
+                new Date().toISOString(),
+            });
+
+        if (insertError) {
+          if (
+            insertError.code ===
+            '23505'
+          ) {
+            duplicates += 1;
+            continue;
+          }
+
+          console.error(
+            'Erro ao cadastrar conta automática:',
+            {
+              code:
+                insertError.code,
+              message:
+                insertError.message,
+            }
+          );
+
+          continue;
+        }
+
+        created += 1;
+      }
+
+      await supabase
+        .from(
+          'connected_email_accounts'
+        )
+        .update({
+          last_sync_at:
+            new Date().toISOString(),
+        })
+        .eq('id', account.id)
+        .eq('user_id', user.id);
+    }
+
+    return NextResponse.json({
+      success: true,
+      accountsProcessed:
+        accounts.length,
+      scanned,
+      detected,
+      created,
+      duplicates,
+      incomplete,
+      attachmentPending,
+      incompleteMessages,
+    });
+  } catch (error) {
+    console.error(
+      'Erro no processamento automático de contas:',
+      error instanceof Error
+        ? error.message
+        : 'Erro desconhecido'
+    );
+
+    return NextResponse.json(
+      {
+        error:
+          'Não foi possível processar automaticamente as contas.',
+      },
+      { status: 500 }
+    );
+  }
+}

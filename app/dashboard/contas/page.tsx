@@ -31,6 +31,7 @@ type BillRecord = {
   amount?: number | string | null;
   due_date?: string | null;
   status?: string | null;
+  payment_url?: string | null;
 };
 
 type BillFormState = {
@@ -232,6 +233,51 @@ export default function ContasPage() {
     setFormError(null);
   }
 
+async function handleScanEmailBills() {
+  try {
+    const response = await fetch(
+  '/api/integrations/microsoft/scan-bills',
+  {
+    method: 'POST',
+  }
+);
+
+    const responseText = await response.text();
+
+let data: any = {};
+
+if (responseText) {
+  try {
+    data = JSON.parse(responseText);
+    console.log('Resultado scan-bills:', data);
+  } catch {
+    throw new Error(
+      `Resposta inválida do servidor. HTTP ${response.status}`
+    );
+  }
+}
+
+    if (!response.ok) {
+      throw new Error(data.error || 'Erro ao analisar e-mails.');
+    }
+
+    await fetchBills();
+
+    toast({
+      title: 'E-mails analisados',
+      description: `${data.scanned} analisados • ${data.detected} financeiros • ${data.created} contas criadas • ${data.duplicates} duplicadas • ${data.incomplete} incompletas`,
+    });
+  } catch (error) {
+    toast({
+      title: 'Erro ao analisar e-mails',
+      description:
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível analisar os e-mails.',
+    });
+  }
+}
+
   function handleOpenCreateModal() {
     resetForm();
     setIsModalOpen(true);
@@ -295,6 +341,31 @@ export default function ContasPage() {
     const supabase = createSupabaseBrowserClient();
     setIsSubmitting(true);
 
+const {
+  data: { user },
+  error: userError,
+} = await supabase.auth.getUser();
+
+if (userError || !user) {
+  setFormError('Não foi possível identificar o usuário.');
+  setIsSubmitting(false);
+  return;
+}
+
+const { data: profile, error: profileError } = await supabase
+  .from('profiles')
+  .select('company_id')
+  .eq('id', user.id)
+  .single();
+
+if (profileError || !profile?.company_id) {
+  setFormError('Não foi possível identificar a empresa do usuário.');
+  setIsSubmitting(false);
+  return;
+}
+
+const companyId = profile.company_id;
+
     if (editingBillId) {
       const { error: updateError } = await supabase
         .from('bills')
@@ -315,6 +386,7 @@ export default function ContasPage() {
     } else {
       const { error: insertError } = await supabase.from('bills').insert([
         {
+          company_id: companyId,
           title: form.title.trim(),
           supplier: form.supplier.trim() || null,
           amount: Number(form.amount),
@@ -503,13 +575,23 @@ export default function ContasPage() {
             Gerencie suas contas e integrações financeiras
           </p>
         </div>
-        <Button
-          className="bg-primary text-primary-foreground hover:bg-primary/90"
-          onClick={handleOpenCreateModal}
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          Nova Conta
-        </Button>
+        <div className="flex flex-wrap gap-2">
+  <Button
+    type="button"
+    variant="outline"
+    onClick={handleScanEmailBills}
+  >
+    Buscar contas nos e-mails
+  </Button>
+
+  <Button
+    className="bg-primary text-primary-foreground hover:bg-primary/90"
+    onClick={handleOpenCreateModal}
+  >
+    <Plus className="mr-2 h-4 w-4" />
+    Nova Conta
+  </Button>
+</div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
@@ -759,7 +841,7 @@ export default function ContasPage() {
                       </span>
                     </p>
                   </div>
-                  <div className="flex flex-col gap-2 sm:flex-row">
+                  <div className="grid grid-cols-2 gap-2">
                     <Button
                       type="button"
                       variant="outline"
@@ -781,6 +863,23 @@ export default function ContasPage() {
                       <CheckCircle2 className="mr-2 h-4 w-4" />
                       {isPaid ? 'Conta paga' : 'Marcar como paga'}
                     </Button>
+                    {bill.payment_url ? (
+  <Button
+    type="button"
+    variant="outline"
+    size="sm"
+    className="flex-1"
+    onClick={() =>
+      window.open(
+        bill.payment_url!,
+        '_blank',
+        'noopener,noreferrer'
+      )
+    }
+  >
+    Abrir boleto
+  </Button>
+) : null}
                     <Button
                       type="button"
                       variant="destructive"
