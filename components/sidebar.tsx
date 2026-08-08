@@ -21,7 +21,7 @@ const navItems = [
   { label: 'Contas', href: '/dashboard/contas', icon: Wallet },
   { label: 'Agenda', href: '/dashboard/agenda', icon: CalendarDays },
   { label: 'Documentos', href: '/dashboard/documentos', icon: FileStack },
-  { label: 'Licitações', href: '/dashboard/licitacoes', icon: FileText },
+  { label: 'E-mails', href: '/dashboard/emails', icon: FileText },
   { label: 'Investimentos', href: '/dashboard/investimentos', icon: TrendingUp },
   { label: 'Configurações', href: '/dashboard/configuracoes', icon: Settings },
 ];
