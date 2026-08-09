@@ -98,6 +98,19 @@ const INFORMATIONAL_NON_BILL_TERMS = [
   'cadastre sua conta por email',
 ];
 
+const NO_CHARGE_TERMS = [
+  'não haverá cobrança',
+  'nao havera cobranca',
+  'não será cobrado',
+  'nao sera cobrado',
+  'sem cobrança',
+  'sem cobranca',
+  'isento de cobrança',
+  'isento de cobranca',
+  'isenção de cobrança',
+  'isencao de cobranca',
+];
+
 function normalizeText(value: string) {
   return value
     .normalize('NFD')
@@ -120,6 +133,15 @@ function isLikelyFinancial(message: GraphMessage) {
   ]
     .filter(Boolean)
     .join(' ');
+
+  const noChargeScore = countTerms(
+    text,
+    NO_CHARGE_TERMS
+  );
+
+  if (noChargeScore > 0) {
+    return false;
+  }
 
   const informationalScore = countTerms(
     text,
