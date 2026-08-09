@@ -74,10 +74,24 @@ function formatDate(value: unknown) {
     return '—';
   }
 
-  const date = new Date(String(value));
-  if (Number.isNaN(date.getTime())) {
+  const rawValue = String(value);
+  const normalizedValue = rawValue.includes('T')
+    ? rawValue.split('T')[0]
+    : rawValue;
+
+  const [year, month, day] = normalizedValue
+    .split('-')
+    .map(Number);
+
+  if (!year || !month || !day) {
     return '—';
   }
+
+  const date = new Date(
+    year,
+    month - 1,
+    day
+  );
 
   return new Intl.DateTimeFormat('pt-BR', {
     dateStyle: 'medium',

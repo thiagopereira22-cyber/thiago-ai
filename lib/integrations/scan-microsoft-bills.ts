@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getValidMicrosoftAccessToken } from '@/lib/integrations/microsoft';
+import { extractFinancialTextFromAttachments } from '@/lib/integrations/extract-bill-attachments';
 
 type GraphMessage = {
   id: string;
@@ -125,6 +126,10 @@ function isLikelyFinancial(message: GraphMessage) {
     INFORMATIONAL_NON_BILL_TERMS
   );
 
+  if (informationalScore > 0) {
+    return false;
+  }
+
   const strongScore = countTerms(
     text,
     STRONG_FINANCIAL_TERMS
@@ -140,48 +145,14 @@ function isLikelyFinancial(message: GraphMessage) {
     PROMOTIONAL_TERMS
   );
 
-  if (
-    message.subject
-      ?.toLowerCase()
-      .includes('conta de luz')
-  ) {
-    console.log('=== PRIMEIRO FILTRO NEOENERGIA ===');
-    console.log('ASSUNTO:', message.subject);
-    console.log('PREVIEW:', message.bodyPreview);
-    console.log('TEXTO:', text);
-    console.log(
-      'INFORMATIVO:',
-      informationalScore
-    );
-    console.log('FORTE:', strongScore);
-    console.log('FRACO:', weakScore);
-    console.log(
-      'PROMOCIONAL:',
-      promotionalScore
-    );
-    console.log(
-      'RESULTADO:',
-      informationalScore === 0 &&
-        (
-          strongScore > 0 ||
-          weakScore >= 2
-        )
-    );
-    console.log('=== FIM PRIMEIRO FILTRO ===');
-  }
-
-  if (informationalScore > 0) {
+  if (promotionalScore > 0) {
     return false;
   }
 
-  if (
-    promotionalScore > 0 &&
-    strongScore === 0
-  ) {
-    return false;
-  }
-
-  return strongScore > 0 || weakScore >= 2;
+  return (
+    strongScore > 0 ||
+    weakScore >= 2
+  );
 }
 
 function isConfirmedFinancialText(text: string) {
@@ -646,11 +617,6 @@ export async function scanMicrosoftBillsForUser(
 
         detected += 1;
 
-console.log(
-  '=== FINANCEIRO DETECTADO ===',
-  message.subject
-);
-
         const { data: existing } =
           await supabase
             .from('bills')
@@ -687,19 +653,7 @@ console.log(
           .filter(Boolean)
           .join('\n');
 
-if (
-  fullMessage.subject?.includes(
-    'CONDOMINIO RESIDENCIAL ALDEPARK'
-  )
-) {
-  console.log('=== EMAIL ALDEPARK ===');
-  console.log('ASSUNTO:', fullMessage.subject);
-  console.log('BODY PREVIEW:', fullMessage.bodyPreview);
-  console.log('BODY CONTENT:', fullMessage.body?.content);
-  console.log('FULL TEXT:', fullText);
-  console.log('=== FIM EMAIL ALDEPARK ===');
-}
-          
+       
         if (
           !isConfirmedFinancialText(
             fullText
@@ -708,34 +662,48 @@ if (
           continue;
         }
 
-        const amount =
-  extractAmount(fullText);
+        let analysisText = fullText;
+
+if (fullMessage.hasAttachments) {
+  try {
+    const attachmentText =
+      await extractFinancialTextFromAttachments(
+        fullMessage.id,
+        accessToken
+      );
+
+    if (attachmentText.trim()) {
+      analysisText = [
+        fullText,
+        attachmentText,
+      ].join('\n');
+    }
+  } catch (error) {
+    console.error(
+      'Erro ao analisar anexos financeiros:',
+      error instanceof Error
+        ? error.message
+        : 'Erro desconhecido'
+    );
+  }
+}
+
+const amount =
+  extractAmount(analysisText);
 
 const dueDate =
-  extractDueDate(fullText);
+  extractDueDate(analysisText);
 
-        const supplier =
-          fullMessage.from?.emailAddress?.name?.trim() ||
-          fullMessage.from?.emailAddress?.address?.trim() ||
-          null;
+const supplier =
+  fullMessage.from?.emailAddress?.name?.trim() ||
+  fullMessage.from?.emailAddress?.address?.trim() ||
+  null;
 
-        const paymentCode =
-  extractPaymentCode(fullText);
+const paymentCode =
+  extractPaymentCode(analysisText);
 
 const paymentUrl =
-  extractPaymentUrl(fullText);
-
-if (
-  supplier?.toLowerCase().includes('neoenergia') ||
-  fullMessage.subject?.toLowerCase().includes('conta de luz')
-) {
-  console.log('=== DIAGNOSTICO NEOENERGIA ===');
-  console.log('ASSUNTO:', fullMessage.subject);
-  console.log('VALOR:', amount);
-  console.log('VENCIMENTO:', dueDate);
-  console.log('LINK:', paymentUrl);
-  console.log('=== FIM NEOENERGIA ===');
-}
+  extractPaymentUrl(analysisText);
 
 if (existing) {
   const updates: {
