@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/cron/scan-bills",
-      "schedule": "0 * * * *"
+      "schedule": "0 9 * * *"
     }
   ]
 }
