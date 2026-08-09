@@ -87,6 +87,16 @@ const PROMOTIONAL_TERMS = [
   'aproveite',
 ];
 
+const INFORMATIONAL_NON_BILL_TERMS = [
+  'escolha como receber sua conta',
+  'como receber sua conta',
+  'forma de recebimento',
+  'receber sua conta por e-mail',
+  'receber sua conta por email',
+  'cadastre sua conta por e-mail',
+  'cadastre sua conta por email',
+];
+
 function normalizeText(value: string) {
   return value
     .normalize('NFD')
@@ -110,11 +120,64 @@ function isLikelyFinancial(message: GraphMessage) {
     .filter(Boolean)
     .join(' ');
 
-  const strongScore = countTerms(text, STRONG_FINANCIAL_TERMS);
-  const weakScore = countTerms(text, WEAK_FINANCIAL_TERMS);
-  const promotionalScore = countTerms(text, PROMOTIONAL_TERMS);
+  const informationalScore = countTerms(
+    text,
+    INFORMATIONAL_NON_BILL_TERMS
+  );
 
-  if (promotionalScore > 0 && strongScore === 0) {
+  const strongScore = countTerms(
+    text,
+    STRONG_FINANCIAL_TERMS
+  );
+
+  const weakScore = countTerms(
+    text,
+    WEAK_FINANCIAL_TERMS
+  );
+
+  const promotionalScore = countTerms(
+    text,
+    PROMOTIONAL_TERMS
+  );
+
+  if (
+    message.subject
+      ?.toLowerCase()
+      .includes('conta de luz')
+  ) {
+    console.log('=== PRIMEIRO FILTRO NEOENERGIA ===');
+    console.log('ASSUNTO:', message.subject);
+    console.log('PREVIEW:', message.bodyPreview);
+    console.log('TEXTO:', text);
+    console.log(
+      'INFORMATIVO:',
+      informationalScore
+    );
+    console.log('FORTE:', strongScore);
+    console.log('FRACO:', weakScore);
+    console.log(
+      'PROMOCIONAL:',
+      promotionalScore
+    );
+    console.log(
+      'RESULTADO:',
+      informationalScore === 0 &&
+        (
+          strongScore > 0 ||
+          weakScore >= 2
+        )
+    );
+    console.log('=== FIM PRIMEIRO FILTRO ===');
+  }
+
+  if (informationalScore > 0) {
+    return false;
+  }
+
+  if (
+    promotionalScore > 0 &&
+    strongScore === 0
+  ) {
     return false;
   }
 
@@ -122,10 +185,37 @@ function isLikelyFinancial(message: GraphMessage) {
 }
 
 function isConfirmedFinancialText(text: string) {
-  const strongScore = countTerms(text, STRONG_FINANCIAL_TERMS);
   const promotionalScore = countTerms(text, PROMOTIONAL_TERMS);
 
-  return strongScore > promotionalScore;
+  const paymentEvidenceTerms = [
+    'valor a pagar',
+    'valor da fatura',
+    'vencimento',
+    'vence em',
+    'boleto',
+    'linha digitavel',
+    'codigo de barras',
+    'pix copia e cola',
+    'pix copia e cole',
+    'segunda via',
+    'conta para pagamento',
+    'fatura disponivel',
+    'sua fatura',
+  ];
+
+  const paymentEvidenceScore = countTerms(
+    text,
+    paymentEvidenceTerms
+  );
+
+  if (
+    promotionalScore > 0 &&
+    paymentEvidenceScore === 0
+  ) {
+    return false;
+  }
+
+  return paymentEvidenceScore > 0;
 }
 
 function extractAmount(text: string): number | null {
@@ -263,32 +353,85 @@ function buildTitle(message: GraphMessage) {
 }
 
 function extractPaymentUrl(text: string): string | null {
-  const links = Array.from(
-    text.matchAll(/<((?:https?:\/\/)[^>\s]+)>/gi)
-  ).map((match) => match[1]);
+  const links = new Set<string>();
 
-  for (const link of links) {
-    const normalized = link.toLowerCase();
+  // Links em href="..."
+  for (const match of Array.from(text.matchAll(
+    /href=["'](https?:\/\/[^"']+)["']/gi
+  ))) {
+    links.add(match[1]);
+  }
+
+  // Links no formato <https://...>
+  for (const match of Array.from(text.matchAll(
+    /<(https?:\/\/[^>\s]+)>/gi
+  ))) {
+    links.add(match[1]);
+  }
+
+  // URLs escritas diretamente no texto
+  for (const match of Array.from(text.matchAll(
+    /https?:\/\/[^\s"'<>]+/gi
+  ))) {
+    links.add(match[0]);
+  }
+
+  const candidates = Array.from(links);
+
+  const financialTerms = [
+    'boleto',
+    'fatura',
+    'segunda-via',
+    'segunda_via',
+    'pagamento',
+    'conta',
+    'invoice',
+    'payment',
+  ];
+
+  // Prioriza URLs que parecem levar diretamente à cobrança
+  for (const link of candidates) {
+    const normalized = normalizeText(link);
 
     if (
-      normalized.includes('safelinks.protection.outlook.com') &&
-      (
-        normalized.includes('boleto') ||
-        normalized.includes('fatura')
+      financialTerms.some((term) =>
+        normalized.includes(term)
       )
     ) {
       return link;
     }
   }
 
-  for (const link of links) {
-    const normalized = link.toLowerCase();
-
+  // SafeLinks da Microsoft podem esconder a URL real
+  for (const link of candidates) {
     if (
-      normalized.includes('boleto') ||
-      normalized.includes('fatura')
+      link
+        .toLowerCase()
+        .includes('safelinks.protection.outlook.com')
     ) {
-      return link;
+      try {
+        const safeLink = new URL(link);
+        const originalUrl =
+          safeLink.searchParams.get('url');
+
+        if (originalUrl) {
+          const decoded =
+            decodeURIComponent(originalUrl);
+
+          const normalized =
+            normalizeText(decoded);
+
+          if (
+            financialTerms.some((term) =>
+              normalized.includes(term)
+            )
+          ) {
+            return decoded;
+          }
+        }
+      } catch {
+        // Ignora SafeLink inválido
+      }
     }
   }
 
@@ -503,6 +646,11 @@ export async function scanMicrosoftBillsForUser(
 
         detected += 1;
 
+console.log(
+  '=== FINANCEIRO DETECTADO ===',
+  message.subject
+);
+
         const { data: existing } =
           await supabase
             .from('bills')
@@ -561,10 +709,10 @@ if (
         }
 
         const amount =
-          extractAmount(fullText);
+  extractAmount(fullText);
 
-        const dueDate =
-          extractDueDate(fullText);
+const dueDate =
+  extractDueDate(fullText);
 
         const supplier =
           fullMessage.from?.emailAddress?.name?.trim() ||
@@ -572,10 +720,22 @@ if (
           null;
 
         const paymentCode =
-          extractPaymentCode(fullText);
+  extractPaymentCode(fullText);
 
 const paymentUrl =
   extractPaymentUrl(fullText);
+
+if (
+  supplier?.toLowerCase().includes('neoenergia') ||
+  fullMessage.subject?.toLowerCase().includes('conta de luz')
+) {
+  console.log('=== DIAGNOSTICO NEOENERGIA ===');
+  console.log('ASSUNTO:', fullMessage.subject);
+  console.log('VALOR:', amount);
+  console.log('VENCIMENTO:', dueDate);
+  console.log('LINK:', paymentUrl);
+  console.log('=== FIM NEOENERGIA ===');
+}
 
 if (existing) {
   const updates: {
@@ -617,6 +777,7 @@ if (existing) {
           ) {
             attachmentPending += 1;
           }
+
 
           incompleteMessages.push({
             account:
