@@ -7,7 +7,8 @@ export const maxDuration = 60;
 const COMPRAS_URL =
   'https://dadosabertos.compras.gov.br/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id';
 
-const LICITACOES_PER_RUN = 50;
+const RECENTES_PER_RUN = 25;
+const HISTORICO_PER_RUN = 25;
 
 type Licitacao = {
   pncp_id: string;
@@ -20,9 +21,6 @@ type Licitacao = {
 type ComprasItem = {
   idCompra?: string;
   idCompraItem?: string;
-
-  idContratacaoPNCP?: string;
-  numeroControlePNCPCompra?: string;
 
   numeroItemPncp?: number;
   numeroItemCompra?: number;
@@ -37,7 +35,6 @@ type ComprasItem = {
   itemCategoriaNome?: string | null;
 
   unidadeMedida?: string | null;
-
   quantidade?: number | null;
 
   valorUnitarioEstimado?: number | null;
@@ -54,8 +51,17 @@ type ComprasItem = {
 type ComprasResponse = {
   resultado?: ComprasItem[];
   totalRegistros?: number;
-  totalPaginas?: number;
-  paginasRestantes?: number;
+};
+
+type ProcessStats = {
+  licitacoesProcessadas: number;
+  licitacoesComItens: number;
+  licitacoesSemItens: number;
+  recordsReceived: number;
+  recordsSaved: number;
+  recordsIgnored: number;
+  concluidas: number;
+  errors: string[];
 };
 
 async function fetchItensByCompra(
@@ -70,7 +76,6 @@ async function fetchItensByCompra(
     `${COMPRAS_URL}?${params.toString()}`,
     {
       cache: 'no-store',
-
       headers: {
         Accept: 'application/json',
       },
@@ -78,8 +83,7 @@ async function fetchItensByCompra(
   );
 
   if (!response.ok) {
-    const body =
-      await response.text();
+    const body = await response.text();
 
     throw new Error(
       `Compras.gov.br respondeu HTTP ${response.status}: ${body.slice(
@@ -89,9 +93,196 @@ async function fetchItensByCompra(
     );
   }
 
-  return (
-    await response.json()
-  ) as ComprasResponse;
+  return (await response.json()) as ComprasResponse;
+}
+
+async function processarLicitacoes(
+  supabase: ReturnType<
+    typeof createSupabaseAdminClient
+  >,
+  licitacoes: Licitacao[]
+): Promise<ProcessStats> {
+  const stats: ProcessStats = {
+    licitacoesProcessadas: 0,
+    licitacoesComItens: 0,
+    licitacoesSemItens: 0,
+    recordsReceived: 0,
+    recordsSaved: 0,
+    recordsIgnored: 0,
+    concluidas: 0,
+    errors: [],
+  };
+
+  for (const licitacao of licitacoes) {
+    const idCompra =
+      licitacao.dados_originais?.idCompra;
+
+    if (!idCompra) {
+      stats.recordsIgnored += 1;
+      stats.concluidas += 1;
+      continue;
+    }
+
+    try {
+      const compras =
+        await fetchItensByCompra(
+          String(idCompra)
+        );
+
+      const items =
+        compras.resultado ?? [];
+
+      stats.licitacoesProcessadas += 1;
+      stats.recordsReceived +=
+        items.length;
+
+      if (!items.length) {
+        stats.licitacoesSemItens += 1;
+        stats.concluidas += 1;
+        continue;
+      }
+
+      stats.licitacoesComItens += 1;
+
+      const now =
+        new Date().toISOString();
+
+      const rows = items
+        .filter((item) => {
+          if (!item.idCompraItem) {
+            stats.recordsIgnored += 1;
+            return false;
+          }
+
+          return true;
+        })
+        .map((item) => ({
+          item_id:
+            item.idCompraItem!,
+
+          pncp_id:
+            licitacao.pncp_id,
+
+          numero_item:
+            item.numeroItemPncp ??
+            item.numeroItemCompra ??
+            null,
+
+          descricao:
+            item.descricaoResumida ||
+            null,
+
+          descricao_detalhada:
+            item.descricaodetalhada ||
+            null,
+
+          material_ou_servico:
+            item.materialOuServico ||
+            null,
+
+          material_ou_servico_nome:
+            item.materialOuServicoNome ||
+            null,
+
+          categoria:
+            item.itemCategoriaNome ||
+            null,
+
+          unidade_medida:
+            item.unidadeMedida ||
+            null,
+
+          quantidade:
+            item.quantidade ??
+            null,
+
+          valor_unitario_estimado:
+            item.valorUnitarioEstimado ??
+            null,
+
+          valor_total_estimado:
+            item.valorTotal ??
+            null,
+
+          situacao:
+            item.situacaoCompraItemNome ||
+            null,
+
+          codigo_catalogo:
+            item.codItemCatalogo ??
+            null,
+
+          data_inclusao:
+            item.dataInclusaoPncp ||
+            null,
+
+          data_atualizacao:
+            item.dataAtualizacaoPncp ||
+            null,
+
+          dados_originais:
+            item,
+
+          sincronizado_em:
+            now,
+
+          updated_at:
+            now,
+        }));
+
+      const uniqueRows =
+        Array.from(
+          new Map(
+            rows.map((row) => [
+              row.item_id,
+              row,
+            ])
+          ).values()
+        );
+
+      if (uniqueRows.length) {
+        const {
+          error: upsertError,
+        } = await supabase
+          .from('licitacao_itens')
+          .upsert(
+            uniqueRows,
+            {
+              onConflict: 'item_id',
+            }
+          );
+
+        if (upsertError) {
+          throw new Error(
+            `Erro Supabase: ${upsertError.message}`
+          );
+        }
+
+        stats.recordsSaved +=
+          uniqueRows.length;
+      }
+
+      stats.concluidas += 1;
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Erro desconhecido';
+
+      stats.errors.push(
+        `${licitacao.pncp_id} / idCompra ${idCompra}: ${message}`
+      );
+
+      console.error(
+        `Erro ao sincronizar ${licitacao.pncp_id}:`,
+        error
+      );
+
+      break;
+    }
+  }
+
+  return stats;
 }
 
 async function runSync() {
@@ -100,9 +291,7 @@ async function runSync() {
       createSupabaseAdminClient();
 
     /*
-     * O registro modalidade_codigo = 0
-     * passa a funcionar como cursor do lote
-     * de licitações.
+     * Cursor exclusivamente para o histórico.
      */
     const {
       data: syncState,
@@ -112,36 +301,32 @@ async function runSync() {
       .select(
         'proxima_pagina,total_paginas'
       )
-      .eq(
-        'modalidade_codigo',
-        0
-      )
+      .eq('modalidade_codigo', 0)
       .maybeSingle();
 
     if (syncStateError) {
       throw new Error(
-        `Erro ao carregar cursor de itens: ${syncStateError.message}`
+        `Erro ao carregar cursor: ${syncStateError.message}`
       );
     }
 
-    /*
-     * proxima_pagina será utilizada como
-     * OFFSET das licitações.
-     */
-    let offset =
-      syncState?.proxima_pagina ?? 0;
+    let historicoOffset =
+      syncState?.proxima_pagina ??
+      RECENTES_PER_RUN;
 
+    /*
+     * O histórico começa depois da faixa
+     * reservada às licitações recentes.
+     */
     if (
-      !Number.isFinite(offset) ||
-      offset < 0
+      !Number.isFinite(historicoOffset) ||
+      historicoOffset <
+        RECENTES_PER_RUN
     ) {
-      offset = 0;
+      historicoOffset =
+        RECENTES_PER_RUN;
     }
 
-    /*
-     * Quantidade total de licitações que
-     * possuem idCompra.
-     */
     const {
       count: totalLicitacoes,
       error: countError,
@@ -169,21 +354,21 @@ async function runSync() {
     const total =
       totalLicitacoes ?? 0;
 
-    /*
-     * Se chegamos ao final do índice,
-     * reiniciamos pelas licitações mais
-     * recentes.
-     */
     if (
-      total === 0 ||
-      offset >= total
+      historicoOffset >= total
     ) {
-      offset = 0;
+      historicoOffset =
+        RECENTES_PER_RUN;
     }
 
+    /*
+     * BLOCO 1
+     * Sempre atualiza as licitações
+     * mais recentes.
+     */
     const {
-      data: licitacoes,
-      error: licitacoesError,
+      data: recentesData,
+      error: recentesError,
     } = await supabase
       .from('licitacoes')
       .select(
@@ -202,254 +387,102 @@ async function runSync() {
         }
       )
       .range(
-        offset,
-        offset +
-          LICITACOES_PER_RUN -
+        0,
+        RECENTES_PER_RUN - 1
+      );
+
+    if (recentesError) {
+      throw new Error(
+        `Erro ao carregar recentes: ${recentesError.message}`
+      );
+    }
+
+    const recentes =
+      (recentesData ?? []) as Licitacao[];
+
+    const statsRecentes =
+      await processarLicitacoes(
+        supabase,
+        recentes
+      );
+
+    /*
+     * Se houve erro nas recentes,
+     * não avançamos o histórico.
+     */
+    if (
+      statsRecentes.errors.length > 0
+    ) {
+      return NextResponse.json({
+        success: false,
+        source:
+          'Compras.gov.br / PNCP - Itens',
+        estrategia:
+          'recentes_mais_historico',
+        fase: 'recentes',
+        recentes: statsRecentes,
+        errors:
+          statsRecentes.errors,
+      });
+    }
+
+    /*
+     * BLOCO 2
+     * Continua preenchendo o histórico
+     * usando o cursor.
+     */
+    const {
+      data: historicoData,
+      error: historicoError,
+    } = await supabase
+      .from('licitacoes')
+      .select(
+        'pncp_id,dados_originais'
+      )
+      .not(
+        'dados_originais->>idCompra',
+        'is',
+        null
+      )
+      .order(
+        'data_publicacao',
+        {
+          ascending: false,
+          nullsFirst: false,
+        }
+      )
+      .range(
+        historicoOffset,
+        historicoOffset +
+          HISTORICO_PER_RUN -
           1
       );
 
-    if (licitacoesError) {
+    if (historicoError) {
       throw new Error(
-        `Erro ao carregar lote de licitações: ${licitacoesError.message}`
+        `Erro ao carregar histórico: ${historicoError.message}`
       );
     }
 
-    const lote =
-      (licitacoes ?? []) as Licitacao[];
+    const historico =
+      (historicoData ?? []) as Licitacao[];
 
-    let licitacoesProcessadas = 0;
-    let licitacoesComItens = 0;
-    let licitacoesSemItens = 0;
+    const statsHistorico =
+      await processarLicitacoes(
+        supabase,
+        historico
+      );
 
-    let recordsReceived = 0;
-    let recordsSaved = 0;
-    let recordsIgnored = 0;
-
-    const errors: string[] = [];
-
-    /*
-     * Quantas posições do lote realmente
-     * foram concluídas.
-     *
-     * Isso permite retomar corretamente
-     * caso uma chamada falhe.
-     */
-    let completedPositions = 0;
-
-    for (
-      const licitacao of lote
-    ) {
-      const idCompra =
-        licitacao.dados_originais
-          ?.idCompra;
-
-      if (!idCompra) {
-        recordsIgnored += 1;
-        completedPositions += 1;
-
-        continue;
-      }
-
-      try {
-        const compras =
-          await fetchItensByCompra(
-            String(idCompra)
-          );
-
-        const items =
-          compras.resultado ?? [];
-
-        licitacoesProcessadas += 1;
-
-        recordsReceived +=
-          items.length;
-
-        if (!items.length) {
-          licitacoesSemItens += 1;
-          completedPositions += 1;
-
-          continue;
-        }
-
-        licitacoesComItens += 1;
-
-        const now =
-          new Date().toISOString();
-
-        const rows =
-          items
-            .filter((item) => {
-              if (!item.idCompraItem) {
-                recordsIgnored += 1;
-
-                return false;
-              }
-
-              return true;
-            })
-            .map((item) => ({
-              item_id:
-                item.idCompraItem!,
-
-              /*
-               * Usamos o pncp_id da própria
-               * licitação consultada.
-               *
-               * Isso evita qualquer problema
-               * caso a API retorne outro campo
-               * vazio ou com nomenclatura
-               * diferente.
-               */
-              pncp_id:
-                licitacao.pncp_id,
-
-              numero_item:
-                item.numeroItemPncp ??
-                item.numeroItemCompra ??
-                null,
-
-              descricao:
-                item.descricaoResumida ||
-                null,
-
-              descricao_detalhada:
-                item.descricaodetalhada ||
-                null,
-
-              material_ou_servico:
-                item.materialOuServico ||
-                null,
-
-              material_ou_servico_nome:
-                item.materialOuServicoNome ||
-                null,
-
-              categoria:
-                item.itemCategoriaNome ||
-                null,
-
-              unidade_medida:
-                item.unidadeMedida ||
-                null,
-
-              quantidade:
-                item.quantidade ??
-                null,
-
-              valor_unitario_estimado:
-                item.valorUnitarioEstimado ??
-                null,
-
-              valor_total_estimado:
-                item.valorTotal ??
-                null,
-
-              situacao:
-                item.situacaoCompraItemNome ||
-                null,
-
-              codigo_catalogo:
-                item.codItemCatalogo ??
-                null,
-
-              data_inclusao:
-                item.dataInclusaoPncp ||
-                null,
-
-              data_atualizacao:
-                item.dataAtualizacaoPncp ||
-                null,
-
-              dados_originais:
-                item,
-
-              sincronizado_em:
-                now,
-
-              updated_at:
-                now,
-            }));
-
-        /*
-         * Evita IDs duplicados dentro
-         * da própria resposta.
-         */
-        const uniqueRows =
-          Array.from(
-            new Map(
-              rows.map(
-                (row) => [
-                  row.item_id,
-                  row,
-                ]
-              )
-            ).values()
-          );
-
-        if (uniqueRows.length) {
-          const {
-            error: upsertError,
-          } = await supabase
-            .from('licitacao_itens')
-            .upsert(
-              uniqueRows,
-              {
-                onConflict:
-                  'item_id',
-              }
-            );
-
-          if (upsertError) {
-            throw new Error(
-              `Erro Supabase: ${upsertError.message}`
-            );
-          }
-
-          recordsSaved +=
-            uniqueRows.length;
-        }
-
-        completedPositions += 1;
-      } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : 'Erro desconhecido';
-
-        errors.push(
-          `${licitacao.pncp_id} / idCompra ${idCompra}: ${message}`
-        );
-
-        console.error(
-          `Erro ao sincronizar itens da licitação ${licitacao.pncp_id}:`,
-          error
-        );
-
-        /*
-         * Interrompemos o lote para não
-         * avançar o cursor além da
-         * licitação que apresentou erro.
-         */
-        break;
-      }
-    }
-
-    /*
-     * Avança exatamente o número de
-     * licitações concluídas.
-     */
     let nextOffset =
-      offset + completedPositions;
+      historicoOffset +
+      statsHistorico.concluidas;
 
-    /*
-     * Se concluímos o último lote,
-     * cursor volta para zero.
-     */
     if (
       total === 0 ||
       nextOffset >= total
     ) {
-      nextOffset = 0;
+      nextOffset =
+        RECENTES_PER_RUN;
     }
 
     const {
@@ -459,18 +492,10 @@ async function runSync() {
       .upsert(
         {
           modalidade_codigo: 0,
-
           proxima_pagina:
             nextOffset,
-
-          /*
-           * Mantemos o nome antigo da
-           * coluna, mas agora ela registra
-           * o total de licitações elegíveis.
-           */
           total_paginas:
             total,
-
           updated_at:
             new Date().toISOString(),
         },
@@ -482,9 +507,14 @@ async function runSync() {
 
     if (stateSaveError) {
       throw new Error(
-        `Erro ao salvar cursor de itens: ${stateSaveError.message}`
+        `Erro ao salvar cursor: ${stateSaveError.message}`
       );
     }
+
+    const errors = [
+      ...statsRecentes.errors,
+      ...statsHistorico.errors,
+    ];
 
     return NextResponse.json({
       success:
@@ -494,32 +524,79 @@ async function runSync() {
         'Compras.gov.br / PNCP - Itens',
 
       estrategia:
-        'itens_por_id_compra',
+        'recentes_mais_historico',
 
       licitacoesElegiveis:
         total,
 
-      lote: {
-        inicio:
-          offset,
+      recentes: {
+        quantidade:
+          recentes.length,
 
-        tamanho:
-          lote.length,
+        processadas:
+          statsRecentes
+            .licitacoesProcessadas,
+
+        itensRecebidos:
+          statsRecentes
+            .recordsReceived,
+
+        itensSalvos:
+          statsRecentes
+            .recordsSaved,
+      },
+
+      historico: {
+        inicio:
+          historicoOffset,
+
+        quantidade:
+          historico.length,
 
         concluidas:
-          completedPositions,
+          statsHistorico.concluidas,
 
         proximoOffset:
           nextOffset,
+
+        processadas:
+          statsHistorico
+            .licitacoesProcessadas,
+
+        itensRecebidos:
+          statsHistorico
+            .recordsReceived,
+
+        itensSalvos:
+          statsHistorico
+            .recordsSaved,
       },
 
-      licitacoesProcessadas,
-      licitacoesComItens,
-      licitacoesSemItens,
+      totais: {
+        licitacoesProcessadas:
+          statsRecentes
+            .licitacoesProcessadas +
+          statsHistorico
+            .licitacoesProcessadas,
 
-      recordsReceived,
-      recordsSaved,
-      recordsIgnored,
+        recordsReceived:
+          statsRecentes
+            .recordsReceived +
+          statsHistorico
+            .recordsReceived,
+
+        recordsSaved:
+          statsRecentes
+            .recordsSaved +
+          statsHistorico
+            .recordsSaved,
+
+        recordsIgnored:
+          statsRecentes
+            .recordsIgnored +
+          statsHistorico
+            .recordsIgnored,
+      },
 
       errors,
     });
