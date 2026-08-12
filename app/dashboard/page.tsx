@@ -199,7 +199,31 @@ export default function DashboardPage() {
               upcomingEvents.map((event) => (
                 <div key={event.id ?? event.title} className="flex items-center justify-between rounded-lg bg-secondary/40 px-3 py-2.5">
                   <span className="text-sm font-medium text-foreground">{event.title ?? 'Compromisso sem título'}</span>
-                  <span className="text-xs text-muted-foreground">{event.event_date ? new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(new Date(`${event.event_date}T00:00:00`)) : '—'}</span>
+                  {(() => {
+  const dateKey = getDateKey(event.event_date);
+
+  if (!dateKey) {
+    return '—';
+  }
+
+  const [year, month, day] = dateKey
+    .split('-')
+    .map(Number);
+
+  const date = new Date(
+    year,
+    month - 1,
+    day
+  );
+
+  return new Intl.DateTimeFormat(
+    'pt-BR',
+    {
+      day: '2-digit',
+      month: '2-digit',
+    }
+  ).format(date);
+})()}
                 </div>
               ))
             )}

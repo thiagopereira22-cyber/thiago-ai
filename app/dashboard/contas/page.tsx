@@ -205,6 +205,7 @@ export default function ContasPage() {
   const [bills, setBills] = useState<BillRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isScanningEmails, setIsScanningEmails] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [activeFilter, setActiveFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
@@ -248,6 +249,12 @@ export default function ContasPage() {
   }
 
 async function handleScanEmailBills() {
+  if (isScanningEmails) {
+    return;
+  }
+
+  setIsScanningEmails(true);
+
   try {
     const response = await fetch(
   '/api/integrations/microsoft/scan-bills',
@@ -281,16 +288,18 @@ if (responseText) {
       title: 'E-mails analisados',
       description: `${data.scanned} analisados • ${data.detected} financeiros • ${data.created} contas criadas • ${data.duplicates} duplicadas • ${data.incomplete} incompletas`,
     });
-  } catch (error) {
-    toast({
-      title: 'Erro ao analisar e-mails',
-      description:
-        error instanceof Error
-          ? error.message
-          : 'Não foi possível analisar os e-mails.',
-    });
+      } catch (error) {
+      toast({
+        title: 'Erro ao analisar e-mails',
+        description:
+          error instanceof Error
+            ? error.message
+            : 'Não foi possível analisar os e-mails.',
+      });
+    } finally {
+      setIsScanningEmails(false);
+    }
   }
-}
 
   function handleOpenCreateModal() {
     resetForm();
@@ -591,12 +600,22 @@ const companyId = profile.company_id;
         </div>
         <div className="flex flex-wrap gap-2">
   <Button
-    type="button"
-    variant="outline"
-    onClick={handleScanEmailBills}
-  >
-    Buscar contas nos e-mails
-  </Button>
+  type="button"
+  variant="outline"
+  onClick={handleScanEmailBills}
+  disabled={isScanningEmails}
+>
+  {isScanningEmails ? (
+    <>
+      <span className="mr-2 inline-block animate-spin">
+        ⟳
+      </span>
+      Analisando e-mails...
+    </>
+  ) : (
+    'Buscar contas nos e-mails'
+  )}
+</Button>
 
   <Button
     className="bg-primary text-primary-foreground hover:bg-primary/90"
@@ -809,108 +828,212 @@ const companyId = profile.company_id;
           </div>
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {filteredBills.map((bill) => {
-            const title = bill.title ?? 'Conta sem título';
-            const supplier = bill.supplier ?? '—';
-            const value = bill.amount ?? 0;
-            const dueDate = bill.due_date ?? null;
-            const status = bill.status ?? 'Sem status';
-            const isPaid = status === 'Pago';
-            const dueStatus = getBillDueStatus(bill);
-            const displayStatus = dueStatus === 'overdue' ? 'Vencida' : dueStatus === 'due_today' ? 'Vence hoje' : dueStatus === 'due_tomorrow' ? 'Vence amanhã' : status;
-            const isOverdue = dueStatus === 'overdue';
-            const cardClasses = isOverdue
-              ? 'border-red-500/40 bg-red-500/10 shadow-sm'
-              : 'border-border bg-card';
+        <div className="overflow-hidden rounded-xl border border-border bg-card">
+  {/* Cabeçalho da lista - desktop */}
+  <div className="hidden grid-cols-[minmax(220px,2fr)_minmax(120px,1fr)_120px_120px_130px_280px] items-center gap-4 border-b border-border bg-secondary/30 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground lg:grid">
+    <div>Conta</div>
+    <div>Fornecedor</div>
+    <div>Valor</div>
+    <div>Vencimento</div>
+    <div>Status</div>
+    <div className="text-right">Ações</div>
+  </div>
 
-            return (
-              <Card key={bill.id ?? title} className={cardClasses}>
-                <CardHeader>
-                  <div className="flex items-center justify-between">
-                    <div className={`flex h-10 w-10 items-center justify-center rounded-lg ${isOverdue ? 'bg-red-500/15' : 'bg-primary/10'}`}>
-                      <Wallet className={`h-5 w-5 ${isOverdue ? 'text-red-500' : 'text-primary'}`} />
-                    </div>
-                  </div>
-                  <CardTitle className="text-base font-semibold text-foreground">
+  <div className="divide-y divide-border">
+    {filteredBills.map((bill) => {
+      const title =
+        bill.title ?? 'Conta sem título';
+
+      const supplier =
+        bill.supplier ?? '—';
+
+      const value =
+        bill.amount ?? 0;
+
+      const dueDate =
+        bill.due_date ?? null;
+
+      const status =
+        bill.status ?? 'Sem status';
+
+      const isPaid =
+        status === 'Pago';
+
+      const dueStatus =
+        getBillDueStatus(bill);
+
+      const displayStatus =
+        dueStatus === 'overdue'
+          ? 'Vencida'
+          : dueStatus === 'due_today'
+            ? 'Vence hoje'
+            : dueStatus === 'due_tomorrow'
+              ? 'Vence amanhã'
+              : status;
+
+      const isOverdue =
+        dueStatus === 'overdue';
+
+      return (
+        <div
+          key={bill.id ?? title}
+          className={
+            isOverdue
+              ? 'bg-red-500/10 px-4 py-4'
+              : 'px-4 py-4'
+          }
+        >
+          <div className="grid gap-3 lg:grid-cols-[minmax(220px,2fr)_minmax(120px,1fr)_120px_120px_130px_280px] lg:items-center lg:gap-4">
+
+            {/* Conta */}
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <div
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
+                    isOverdue
+                      ? 'bg-red-500/15'
+                      : 'bg-primary/10'
+                  }`}
+                >
+                  <Wallet
+                    className={`h-4 w-4 ${
+                      isOverdue
+                        ? 'text-red-500'
+                        : 'text-primary'
+                    }`}
+                  />
+                </div>
+
+                <div className="min-w-0">
+                  <p className="truncate font-medium text-foreground">
                     {title}
-                  </CardTitle>
-                  <CardDescription className="text-sm text-muted-foreground">
+                  </p>
+
+                  {/* Só aparece no celular */}
+                  <p className="truncate text-xs text-muted-foreground lg:hidden">
                     {supplier}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <div className="text-2xl font-bold text-foreground">
-                    {formatCurrency(value)}
-                  </div>
-                  <div className="space-y-1 text-sm text-muted-foreground">
-                    <p>
-                      <span className="font-medium text-foreground">Vencimento:</span>{' '}
-                      {formatDate(dueDate)}
-                    </p>
-                    <p>
-                      <span className="font-medium text-foreground">Status:</span>{' '}
-                      <span className={isOverdue ? 'font-semibold text-red-500' : 'font-medium text-foreground'}>
-                        {displayStatus}
-                      </span>
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="flex-1"
-                      onClick={() => handleOpenEditModal(bill)}
-                    >
-                      <Pencil className="mr-2 h-4 w-4" />
-                      Editar
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="flex-1"
-                      onClick={() => void handleMarkAsPaid(bill.id)}
-                      disabled={isSubmitting || isPaid}
-                    >
-                      <CheckCircle2 className="mr-2 h-4 w-4" />
-                      {isPaid ? 'Conta paga' : 'Marcar como paga'}
-                    </Button>
-                    {bill.payment_url ? (
-  <Button
-    type="button"
-    variant="outline"
-    size="sm"
-    className="flex-1"
-    onClick={() =>
-      window.open(
-        bill.payment_url!,
-        '_blank',
-        'noopener,noreferrer'
-      )
-    }
-  >
-    Abrir boleto
-  </Button>
-) : null}
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      size="sm"
-                      className="flex-1"
-                      onClick={() => handleOpenDeleteModal(bill)}
-                      disabled={isSubmitting}
-                    >
-                      <Trash2 className="mr-2 h-4 w-4" />
-                      Excluir
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-            );
-          })}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Fornecedor */}
+            <div className="hidden min-w-0 lg:block">
+              <p className="truncate text-sm text-muted-foreground">
+                {supplier}
+              </p>
+            </div>
+
+            {/* Valor */}
+            <div>
+              <span className="mr-2 text-xs text-muted-foreground lg:hidden">
+                Valor:
+              </span>
+              <span className="font-semibold text-foreground">
+                {formatCurrency(value)}
+              </span>
+            </div>
+
+            {/* Vencimento */}
+            <div className="text-sm">
+              <span className="mr-2 text-xs text-muted-foreground lg:hidden">
+                Vencimento:
+              </span>
+              <span className="text-foreground">
+                {formatDate(dueDate)}
+              </span>
+            </div>
+
+            {/* Status */}
+            <div>
+              <span
+                className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
+                  isOverdue
+                    ? 'bg-red-500/15 text-red-500'
+                    : isPaid
+                      ? 'bg-green-500/15 text-green-600'
+                      : dueStatus === 'due_today'
+                        ? 'bg-amber-500/15 text-amber-600'
+                        : 'bg-secondary text-foreground'
+                }`}
+              >
+                {displayStatus}
+              </span>
+            </div>
+
+            {/* Ações */}
+            <div className="flex flex-wrap justify-start gap-1.5 lg:justify-end">
+              {bill.payment_url ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    window.open(
+                      bill.payment_url!,
+                      '_blank',
+                      'noopener,noreferrer'
+                    )
+                  }
+                >
+                  Abrir boleto
+                </Button>
+              ) : null}
+
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  handleOpenEditModal(bill)
+                }
+              >
+                <Pencil className="h-4 w-4" />
+                <span className="sr-only">
+                  Editar
+                </span>
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  void handleMarkAsPaid(bill.id)
+                }
+                disabled={
+                  isSubmitting || isPaid
+                }
+              >
+                <CheckCircle2 className="h-4 w-4" />
+                <span className="sr-only">
+                  {isPaid
+                    ? 'Conta paga'
+                    : 'Marcar como paga'}
+                </span>
+              </Button>
+
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                onClick={() =>
+                  handleOpenDeleteModal(bill)
+                }
+                disabled={isSubmitting}
+              >
+                <Trash2 className="h-4 w-4" />
+                <span className="sr-only">
+                  Excluir
+                </span>
+              </Button>
+            </div>
+          </div>
         </div>
+      );
+    })}
+  </div>
+</div>
       )}
 
       <Dialog open={isModalOpen} onOpenChange={handleModalOpenChange}>

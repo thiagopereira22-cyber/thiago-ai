@@ -4,6 +4,14 @@
     {
       "path": "/api/cron/scan-bills",
       "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/licitacoes/sync",
+      "schedule": "0 */6 * * *"
+    },
+    {
+      "path": "/api/licitacoes/sync-itens",
+      "schedule": "30 */6 * * *"
     }
   ]
 }

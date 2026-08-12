@@ -8,6 +8,7 @@ import {
   CalendarDays,
   FileText,
   FileStack,
+  Gavel,
   TrendingUp,
   Settings,
   Sparkles,
@@ -22,6 +23,7 @@ const navItems = [
   { label: 'Agenda', href: '/dashboard/agenda', icon: CalendarDays },
   { label: 'Documentos', href: '/dashboard/documentos', icon: FileStack },
   { label: 'E-mails', href: '/dashboard/emails', icon: FileText },
+  { label: 'Licitações', href: '/dashboard/licitacoes', icon: Gavel },
   { label: 'Investimentos', href: '/dashboard/investimentos', icon: TrendingUp },
   { label: 'Configurações', href: '/dashboard/configuracoes', icon: Settings },
 ];

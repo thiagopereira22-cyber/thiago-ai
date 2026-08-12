@@ -2,6 +2,10 @@ import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getValidMicrosoftAccessToken } from '@/lib/integrations/microsoft';
 import { extractFinancialTextFromAttachments } from '@/lib/integrations/extract-bill-attachments';
+import {
+  createGoogleCalendarEvent,
+  getValidGoogleAccessToken,
+} from '@/lib/integrations/google-calendar';
 
 type GraphMessage = {
   id: string;
@@ -345,6 +349,82 @@ function buildTitle(message: GraphMessage) {
   return subject.slice(0, 180);
 }
 
+function isGenericBillTitle(value: string) {
+  const normalized = value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const genericTitles = [
+    'conta detectada por e-mail',
+    'conta detectada por email',
+    'disponivel para pagamento',
+    'fatura disponivel para pagamento',
+    'boleto disponivel para pagamento',
+    'pagamento',
+    'fatura',
+    'boleto',
+    'cobranca',
+  ];
+
+  return genericTitles.includes(normalized);
+}
+
+function resolveBillSupplier(
+  message: GraphMessage,
+  analysisText: string,
+  billTitle: string
+): string | null {
+  /*
+   * Primeiro tenta descobrir o beneficiário real
+   * dentro do boleto/e-mail.
+   */
+  const patterns = [
+    /benefici[aá]rio\s*:?\s*([^\r\n|]{3,120})/i,
+    /cedente\s*:?\s*([^\r\n|]{3,120})/i,
+    /recebedor\s*:?\s*([^\r\n|]{3,120})/i,
+    /raz[aã]o\s+social\s*:?\s*([^\r\n|]{3,120})/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = analysisText.match(pattern);
+
+    if (match?.[1]) {
+      const candidate = match[1]
+        .replace(/\s+/g, ' ')
+        .replace(/\s*CNPJ\s*:?.*$/i, '')
+        .trim();
+
+      if (candidate.length >= 3) {
+        return candidate.slice(0, 180);
+      }
+    }
+  }
+
+  /*
+   * Se o assunto do e-mail já contém um nome
+   * específico, ele é melhor que um remetente
+   * genérico/encaminhado.
+   */
+  if (
+    billTitle &&
+    !isGenericBillTitle(billTitle)
+  ) {
+    return billTitle.slice(0, 180);
+  }
+
+  /*
+   * Último recurso: remetente do e-mail.
+   */
+  return (
+    message.from?.emailAddress?.name?.trim() ||
+    message.from?.emailAddress?.address?.trim() ||
+    null
+  );
+}
+
 function extractPaymentUrl(text: string): string | null {
   const links = new Set<string>();
 
@@ -522,6 +602,240 @@ async function fetchRecentMessages(
 
   return payload.value || [];
 }
+
+
+type BillCalendarSyncInput = {
+  id: string;
+  title?: string | null;
+  supplier?: string | null;
+  amount?: number | string | null;
+  dueDate: string;
+  paymentCode?: string | null;
+};
+
+async function syncBillWithCalendars({
+  supabase,
+  userId,
+  companyId,
+  bill,
+}: {
+  supabase: SupabaseClient;
+  userId: string;
+  companyId: string;
+  bill: BillCalendarSyncInput;
+}) {
+  const dueDate = String(bill.dueDate).split('T')[0];
+
+  if (!dueDate) {
+    return;
+  }
+
+  const eventOrigin = `bill:${bill.id}`;
+
+  const numericAmount = Number(bill.amount ?? 0);
+
+  const formattedAmount =
+    new Intl.NumberFormat('pt-BR', {
+      style: 'currency',
+      currency: 'BRL',
+    }).format(
+      Number.isFinite(numericAmount)
+        ? numericAmount
+        : 0
+    );
+
+  const eventTitle =
+    `Vencimento: ${
+      bill.supplier ||
+      bill.title ||
+      'Conta'
+    }`;
+
+  const eventDescription = [
+    `Conta: ${bill.title || 'Conta'}`,
+    `Valor: ${formattedAmount}`,
+    `Vencimento: ${dueDate}`,
+    bill.paymentCode
+      ? `Código de pagamento: ${bill.paymentCode}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const eventDate =
+    `${dueDate}T12:00:00.000Z`;
+
+  /*
+   * 1. Localiza ou cria o evento interno do Omnia.
+   */
+  const {
+    data: existingEvent,
+    error: existingEventError,
+  } = await supabase
+    .from('events')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('origin', eventOrigin)
+    .maybeSingle();
+
+  if (existingEventError) {
+    console.error(
+      'Erro ao verificar evento da conta:',
+      existingEventError.message
+    );
+    return;
+  }
+
+  let internalEventId =
+    existingEvent?.id ?? null;
+
+  if (!internalEventId) {
+    const {
+      data: createdEvent,
+      error: eventError,
+    } = await supabase
+      .from('events')
+      .insert({
+        company_id: companyId,
+        title: eventTitle,
+        description: eventDescription,
+        event_date: eventDate,
+        origin: eventOrigin,
+      })
+      .select('id')
+      .single();
+
+    if (eventError || !createdEvent?.id) {
+      console.error(
+        'Não foi possível criar evento na Agenda:',
+        eventError?.message ||
+          'ID do evento não retornado.'
+      );
+      return;
+    }
+
+    internalEventId =
+      createdEvent.id;
+  }
+
+  /*
+   * 2. Localiza calendários Google conectados.
+   */
+  const {
+    data: calendarAccounts,
+    error: calendarAccountsError,
+  } = await supabase
+    .from('connected_calendar_accounts')
+    .select('id,calendar_id')
+    .eq('user_id', userId)
+    .eq('company_id', companyId)
+    .eq('provider', 'google')
+    .eq('status', 'connected');
+
+  if (calendarAccountsError) {
+    console.error(
+      'Erro ao consultar Google Calendar:',
+      calendarAccountsError.message
+    );
+    return;
+  }
+
+  /*
+   * 3. Para cada Google Calendar, verifica se
+   *    o evento já foi enviado.
+   */
+  for (const calendarAccount of calendarAccounts ?? []) {
+    const {
+      data: existingLink,
+      error: existingLinkError,
+    } = await supabase
+      .from('google_calendar_event_links')
+      .select('id,google_event_id')
+      .eq('event_id', internalEventId)
+      .eq(
+        'connected_calendar_account_id',
+        calendarAccount.id
+      )
+      .maybeSingle();
+
+    if (existingLinkError) {
+      console.error(
+        'Erro ao verificar vínculo Google Calendar:',
+        existingLinkError.message
+      );
+      continue;
+    }
+
+    if (existingLink) {
+      continue;
+    }
+
+    try {
+      const accessToken =
+        await getValidGoogleAccessToken(
+          supabase,
+          userId,
+          calendarAccount.id
+        );
+
+      const googleEvent =
+        await createGoogleCalendarEvent(
+          accessToken,
+          calendarAccount.calendar_id ||
+            'primary',
+          {
+            title: eventTitle,
+            description: eventDescription,
+            date: dueDate,
+          }
+        );
+
+      if (!googleEvent?.id) {
+        throw new Error(
+          'Google Calendar não retornou o ID do evento.'
+        );
+      }
+
+      const { error: linkError } =
+        await supabase
+          .from('google_calendar_event_links')
+          .insert({
+            event_id: internalEventId,
+            connected_calendar_account_id:
+              calendarAccount.id,
+            google_event_id:
+              googleEvent.id,
+          });
+
+      if (linkError) {
+        console.error(
+          'Evento criado no Google, mas o vínculo não pôde ser salvo:',
+          linkError.message
+        );
+        continue;
+      }
+
+      console.log(
+        'EVENTO GOOGLE SINCRONIZADO:',
+        {
+          billId: bill.id,
+          eventId: internalEventId,
+          googleEventId:
+            googleEvent.id,
+          dueDate,
+        }
+      );
+    } catch (googleError) {
+      console.error(
+        'Erro ao sincronizar evento com Google Calendar:',
+        googleError instanceof Error
+          ? googleError.message
+          : googleError
+      );
+    }
+  }
+}
+
 
 export async function scanMicrosoftBillsForUser(
   supabase: SupabaseClient,
@@ -710,136 +1024,190 @@ if (fullMessage.hasAttachments) {
   }
 }
 
-const amount =
-  extractAmount(analysisText);
+          const amount =
+            extractAmount(analysisText);
 
-const dueDate =
-  extractDueDate(analysisText);
+          const dueDate =
+            extractDueDate(analysisText);
 
-const supplier =
-  fullMessage.from?.emailAddress?.name?.trim() ||
-  fullMessage.from?.emailAddress?.address?.trim() ||
-  null;
+          const billTitle =
+            buildTitle(fullMessage);
 
-const paymentCode =
-  extractPaymentCode(analysisText);
+          const supplier =
+            resolveBillSupplier(
+              fullMessage,
+              analysisText,
+              billTitle
+            );
 
-const paymentUrl =
-  extractPaymentUrl(analysisText);
+          const paymentCode =
+            extractPaymentCode(analysisText);
 
-if (existing) {
-  const updates: {
-    payment_url?: string;
-    payment_code?: string;
-  } = {};
+          const paymentUrl =
+            extractPaymentUrl(analysisText);
 
-  if (paymentUrl) {
-    updates.payment_url = paymentUrl;
-  }
+          /*
+           * Se a conta já existe, reprocessa os dados
+           * usando as regras atuais de identificação.
+           */
+          if (existing) {
+            const updates: {
+              title?: string;
+              supplier?: string;
+              payment_url?: string;
+              payment_code?: string;
+            } = {};
 
-  if (paymentCode) {
-    updates.payment_code = paymentCode;
-  }
+            if (
+              billTitle &&
+              !isGenericBillTitle(billTitle)
+            ) {
+              updates.title = billTitle;
+            }
 
-  if (Object.keys(updates).length > 0) {
-    const { error: updateExistingError } = await supabase
-      .from('bills')
-      .update(updates)
-      .eq('id', existing.id);
+            if (supplier) {
+              updates.supplier = supplier;
+            }
 
-    if (updateExistingError) {
-      console.error(
-        'Erro ao completar dados da conta existente:',
-        updateExistingError.message
-      );
-    }
-  }
+            if (paymentUrl) {
+              updates.payment_url = paymentUrl;
+            }
 
-  duplicates += 1;
-  continue;
-}
+            if (paymentCode) {
+              updates.payment_code = paymentCode;
+            }
 
-        if (!amount || !dueDate) {
-          incomplete += 1;
+            if (Object.keys(updates).length > 0) {
+              const {
+                error: updateExistingError,
+              } = await supabase
+                .from('bills')
+                .update(updates)
+                .eq('id', existing.id)
+                .eq('company_id', companyId);
 
-          if (
-            fullMessage.hasAttachments
-          ) {
-            attachmentPending += 1;
-          }
+              if (updateExistingError) {
+                console.error(
+                  'Erro ao reprocessar conta existente:',
+                  updateExistingError.message
+                );
+              } else {
+                console.log(
+                  'CONTA EXISTENTE REPROCESSADA:',
+                  {
+                    billId: existing.id,
+                    title: updates.title,
+                    supplier: updates.supplier,
+                  }
+                );
+              }
+            }
 
-
-          incompleteMessages.push({
-            account:
-              account.email_address,
-            subject:
-              fullMessage.subject ||
-              'Sem assunto',
-            supplier:
-              supplier ||
-              'Desconhecido',
-            amount,
-            dueDate,
-            hasAttachments:
-              Boolean(
-                fullMessage.hasAttachments
-              ),
-          });
-
-          continue;
-        }
-
-        const { error: insertError } =
-          await supabase
-            .from('bills')
-            .insert({
-              company_id: companyId,
-              title:
-                buildTitle(
-                  fullMessage
-                ),
-              supplier,
-              amount,
-              due_date: dueDate,
-              status: 'Pendente',
-              source:
-                'microsoft_email',
-              source_message_id:
-                fullMessage.id,
-              source_account_id:
-                account.id,
-              payment_code:
-                paymentCode,
-              payment_url:
-                paymentUrl,
-              detected_at:
-                new Date().toISOString(),
-            });
-
-        if (insertError) {
-          if (
-            insertError.code ===
-            '23505'
-          ) {
             duplicates += 1;
             continue;
           }
 
-          console.error(
-            'Erro ao cadastrar conta automática:',
-            {
-              code:
-                insertError.code,
-              message:
-                insertError.message,
+          if (!amount || !dueDate) {
+            incomplete += 1;
+
+            if (fullMessage.hasAttachments) {
+              attachmentPending += 1;
             }
-          );
 
-          continue;
-        }
+            incompleteMessages.push({
+              account:
+                account.email_address,
+              subject:
+                fullMessage.subject ||
+                'Sem assunto',
+              supplier:
+                supplier ||
+                'Desconhecido',
+              amount,
+              dueDate,
+              hasAttachments:
+                Boolean(
+                  fullMessage.hasAttachments
+                ),
+            });
 
-        created += 1;
-      }
+            continue;
+          }
+
+const {
+  data: insertedBill,
+  error: insertError,
+} = await supabase
+  .from('bills')
+  .insert({
+    company_id: companyId,
+    title: billTitle,
+    supplier,
+    amount,
+    due_date: dueDate,
+    status: 'Pendente',
+    source: 'microsoft_email',
+    source_message_id:
+      fullMessage.id,
+    source_account_id:
+      account.id,
+    payment_code:
+      paymentCode,
+    payment_url:
+      paymentUrl,
+    detected_at:
+      new Date().toISOString(),
+  })
+  .select('id')
+  .single();
+
+if (insertError) {
+  if (
+    insertError.code === '23505'
+  ) {
+    duplicates += 1;
+    continue;
+  }
+
+  console.error(
+    'Erro ao cadastrar conta automática:',
+    {
+      code: insertError.code,
+      message: insertError.message,
+    }
+  );
+
+  continue;
+}
+
+created += 1;
+
+/*
+ * Cria automaticamente o compromisso
+ * correspondente na Agenda.
+ *
+ * O ID da conta fica registrado em origin,
+ * permitindo identificar a origem e evitar
+ * duplicidade.
+ */
+
+if (insertedBill?.id) {
+  await syncBillWithCalendars({
+    supabase,
+    userId,
+    companyId,
+    bill: {
+      id: insertedBill.id,
+      title: billTitle,
+      supplier,
+      amount,
+      dueDate,
+      paymentCode,
+    },
+  });
+}
+
+  }
 
       await supabase
         .from(
@@ -852,6 +1220,44 @@ if (existing) {
         .eq('id', account.id)
         .eq('user_id', userId);
     }
+
+  /*
+   * Garante que contas pendentes já existentes também
+   * estejam sincronizadas com Agenda Omnia e Google Calendar.
+   */
+  const { data: billsForCalendarSync, error: billsForCalendarSyncError } =
+    await supabase
+      .from('bills')
+      .select(
+        'id,title,supplier,amount,due_date,payment_code,status'
+      )
+      .eq('company_id', companyId)
+      .neq('status', 'Pago')
+      .not('due_date', 'is', null);
+
+  if (billsForCalendarSyncError) {
+    console.error(
+      'Erro ao consultar contas para sincronização de calendário:',
+      billsForCalendarSyncError.message
+    );
+  } else {
+    for (const bill of billsForCalendarSync ?? []) {
+      await syncBillWithCalendars({
+        supabase,
+        userId,
+        companyId,
+        bill: {
+          id: bill.id,
+          title: bill.title,
+          supplier: bill.supplier,
+          amount: bill.amount,
+          dueDate: String(bill.due_date).split('T')[0],
+          paymentCode: bill.payment_code,
+        },
+      });
+    }
+  }
+
 
     return NextResponse.json({
       success: true,
