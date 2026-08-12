@@ -140,8 +140,11 @@ async function runSync() {
       formatDate(end);
 
     /*
-     * Carrega todas as licitações que
-     * já estão indexadas no banco.
+     * Carrega todas as licitações que já
+     * estão indexadas no banco.
+     *
+     * Fazemos em lotes porque o Supabase
+     * pode limitar a resposta.
      */
     const pncpIds =
       new Set<string>();
@@ -189,11 +192,10 @@ async function runSync() {
     }
 
     /*
-     * Estado da sincronização dos itens.
+     * Estado global da sincronização dos itens.
      *
-     * Usaremos modalidade_codigo = 0
-     * para representar o cursor global
-     * da API de itens.
+     * modalidade_codigo = 0 representa
+     * o cursor da API de itens.
      */
     const {
       data: syncState,
@@ -203,7 +205,10 @@ async function runSync() {
       .select(
         'proxima_pagina,total_paginas'
       )
-      .eq('modalidade_codigo', 0)
+      .eq(
+        'modalidade_codigo',
+        0
+      )
       .maybeSingle();
 
     if (syncStateError) {
@@ -212,22 +217,25 @@ async function runSync() {
       );
     }
 
-    let startPage =
-      syncState?.proxima_pagina ?? 1;
+    /*
+     * Consultamos a página 1 somente para
+     * descobrir o número TOTAL de páginas
+     * existente neste momento.
+     *
+     * Não salvamos seus itens aqui.
+     */
+    const primeiraConsulta =
+      await fetchPage({
+        page: 1,
+        startDate,
+        endDate,
+      });
 
-    if (
-      !Number.isFinite(startPage) ||
-      startPage < 1
-    ) {
-      startPage = 1;
-    }
+    let totalRegistros =
+      primeiraConsulta.totalRegistros ?? 0;
 
-    let nextPage =
-      startPage;
-
-    let totalRegistros = 0;
     let totalPaginas =
-      syncState?.total_paginas ?? 0;
+      primeiraConsulta.totalPaginas ?? 0;
 
     let pagesProcessed = 0;
 
@@ -239,32 +247,123 @@ async function runSync() {
     const errors: string[] = [];
 
     /*
-     * Processamos no máximo cinco páginas
-     * por execução.
-     *
-     * A diferença agora é que começamos
-     * de onde a execução anterior parou.
+     * Se não houver páginas, salvamos o
+     * estado vazio e encerramos normalmente.
      */
-    for (
-      let offset = 0;
-      offset < MAX_PAGES_PER_RUN;
-      offset += 1
-    ) {
-      const page =
-        startPage + offset;
+    if (totalPaginas < 1) {
+      const {
+        error: stateSaveError,
+      } = await supabase
+        .from('licitacoes_sync_state')
+        .upsert(
+          {
+            modalidade_codigo: 0,
 
-      /*
-       * Se já sabemos o total de páginas
-       * e ultrapassamos o final, encerramos.
-       */
-      if (
-        totalPaginas > 0 &&
-        page > totalPaginas
-      ) {
-        nextPage = 1;
-        break;
+            proxima_pagina: 0,
+
+            total_paginas: 0,
+
+            updated_at:
+              new Date().toISOString(),
+          },
+          {
+            onConflict:
+              'modalidade_codigo',
+          }
+        );
+
+      if (stateSaveError) {
+        throw new Error(
+          `Erro ao salvar estado da sincronização de itens: ${stateSaveError.message}`
+        );
       }
 
+      return NextResponse.json({
+        success: true,
+
+        source:
+          'Compras.gov.br / PNCP - Itens',
+
+        estrategia:
+          'mais_recentes_primeiro',
+
+        periodo: {
+          inicio: startDate,
+          fim: endDate,
+        },
+
+        licitacoesIndexadas:
+          pncpIds.size,
+
+        paginaInicial: 0,
+        proximaPagina: 0,
+
+        totalRegistros: 0,
+        totalPaginas: 0,
+
+        pagesProcessed: 0,
+
+        recordsReceived: 0,
+        recordsMatched: 0,
+        recordsSaved: 0,
+        recordsIgnored: 0,
+
+        errors: [],
+      });
+    }
+
+    /*
+     * Se existe cursor válido, continuamos
+     * daquela página.
+     *
+     * Se o cursor é 0, inexistente ou ficou
+     * maior que o total atual, começamos pela
+     * ÚLTIMA página.
+     */
+    let startPage =
+      syncState?.proxima_pagina ?? 0;
+
+    if (
+      !Number.isFinite(startPage) ||
+      startPage < 1 ||
+      startPage > totalPaginas
+    ) {
+      startPage =
+        totalPaginas;
+    }
+
+    const paginaInicial =
+      startPage;
+
+    /*
+     * Exemplo:
+     *
+     * totalPaginas = 219
+     * startPage = 219
+     *
+     * processaremos:
+     * 219, 218, 217, 216 e 215.
+     */
+    const endPage =
+      Math.max(
+        1,
+        startPage -
+          MAX_PAGES_PER_RUN +
+          1
+      );
+
+    /*
+     * Se nada for processado, mantemos
+     * o cursor atual.
+     */
+    let nextPage =
+      startPage;
+
+    for (
+      let page = startPage;
+      page >= endPage;
+      page -= 1
+    ) {
       try {
         const compras =
           await fetchPage({
@@ -276,15 +375,23 @@ async function runSync() {
         pagesProcessed += 1;
 
         /*
-         * A primeira página consultada nesta
-         * execução atualiza os totais.
+         * Atualizamos os totais caso a API
+         * devolva valores mais recentes.
          */
-        if (offset === 0) {
+        if (
+          compras.totalRegistros !==
+          undefined
+        ) {
           totalRegistros =
-            compras.totalRegistros ?? 0;
+            compras.totalRegistros;
+        }
 
+        if (
+          compras.totalPaginas !==
+          undefined
+        ) {
           totalPaginas =
-            compras.totalPaginas ?? 0;
+            compras.totalPaginas;
         }
 
         const items =
@@ -294,17 +401,19 @@ async function runSync() {
           items.length;
 
         /*
-         * Se não vier nenhum item,
-         * consideramos que chegamos ao final.
+         * Uma página vazia é considerada
+         * concluída. Seguimos para a anterior.
          */
         if (!items.length) {
-          nextPage = 1;
-          break;
+          nextPage =
+            page - 1;
+
+          continue;
         }
 
         /*
-         * Mantemos somente itens de
-         * licitações já indexadas.
+         * Mantemos somente itens pertencentes
+         * às licitações já indexadas.
          */
         const matchedItems =
           items.filter((item) => {
@@ -449,10 +558,11 @@ async function runSync() {
             );
 
             /*
-             * Não avançamos o cursor se
-             * essa página não foi salva.
+             * Mantemos esta página como cursor
+             * para tentar novamente depois.
              */
-            nextPage = page;
+            nextPage =
+              page;
 
             break;
           }
@@ -463,22 +573,12 @@ async function runSync() {
 
         /*
          * Página concluída com sucesso.
-         * Próxima execução começa na seguinte.
+         *
+         * Como estamos indo de trás para frente,
+         * a próxima é a página anterior.
          */
         nextPage =
-          page + 1;
-
-        /*
-         * Chegamos à última página real.
-         * Reiniciaremos o ciclo.
-         */
-        if (
-          totalPaginas > 0 &&
-          page >= totalPaginas
-        ) {
-          nextPage = 1;
-          break;
-        }
+          page - 1;
       } catch (error) {
         const message =
           error instanceof Error
@@ -495,18 +595,29 @@ async function runSync() {
         );
 
         /*
-         * Mantém a página problemática
-         * para tentar novamente depois.
+         * Mantemos a página problemática
+         * para tentar novamente.
          */
-        nextPage = page;
+        nextPage =
+          page;
 
         break;
       }
     }
 
     /*
-     * Salva o cursor somente depois
-     * do processamento.
+     * Chegamos à página 1.
+     *
+     * Cursor 0 significa:
+     * na próxima execução consulte novamente
+     * o total e comece pela página mais recente.
+     */
+    if (nextPage < 1) {
+      nextPage = 0;
+    }
+
+    /*
+     * Salva o cursor depois do processamento.
      */
     const {
       error: stateSaveError,
@@ -544,16 +655,21 @@ async function runSync() {
       source:
         'Compras.gov.br / PNCP - Itens',
 
+      estrategia:
+        'mais_recentes_primeiro',
+
       periodo: {
-        inicio: startDate,
-        fim: endDate,
+        inicio:
+          startDate,
+
+        fim:
+          endDate,
       },
 
       licitacoesIndexadas:
         pncpIds.size,
 
-      paginaInicial:
-        startPage,
+      paginaInicial,
 
       proximaPagina:
         nextPage,
@@ -591,6 +707,7 @@ async function runSync() {
     );
   }
 }
+
 export async function POST() {
   return runSync();
 }

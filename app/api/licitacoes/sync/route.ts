@@ -25,11 +25,13 @@ const MODALIDADES = [
 const PAGE_SIZE = 100;
 
 /*
- * Nesta etapa vamos trazer 5 páginas
- * de cada modalidade.
+ * Processamos até 5 páginas por modalidade.
  *
  * 3 modalidades x 5 páginas x 100
  * = até 1.500 registros por execução.
+ *
+ * A diferença agora é que percorremos
+ * das páginas mais recentes para as antigas.
  */
 const MAX_PAGES_PER_MODALIDADE = 5;
 
@@ -157,6 +159,9 @@ async function runSync() {
     const supabase =
       createSupabaseAdminClient();
 
+    /*
+     * Mantemos a janela dos últimos 30 dias.
+     */
     const end = new Date();
 
     const start = new Date();
@@ -183,6 +188,8 @@ async function runSync() {
       modalidade: string;
       totalRegistros: number;
       totalPaginas: number;
+      paginaInicial: number;
+      proximaPagina: number;
       paginasProcessadas: number;
       registrosRecebidos: number;
       registrosSalvos: number;
@@ -198,48 +205,162 @@ async function runSync() {
       let paginasModalidade = 0;
       let recebidosModalidade = 0;
       let salvosModalidade = 0;
+
       /*
- * Recupera de onde a sincronização
- * desta modalidade deve continuar.
- */
-const {
-  data: syncState,
-  error: syncStateError,
-} = await supabase
-  .from('licitacoes_sync_state')
-  .select('proxima_pagina,total_paginas')
-  .eq(
-    'modalidade_codigo',
-    modalidade.codigo
-  )
-  .maybeSingle();
+       * Recuperamos o estado incremental
+       * dessa modalidade.
+       */
+      const {
+        data: syncState,
+        error: syncStateError,
+      } = await supabase
+        .from('licitacoes_sync_state')
+        .select(
+          'proxima_pagina,total_paginas'
+        )
+        .eq(
+          'modalidade_codigo',
+          modalidade.codigo
+        )
+        .maybeSingle();
 
-if (syncStateError) {
-  throw new Error(
-    `Erro ao consultar progresso de ${modalidade.nome}: ${syncStateError.message}`
-  );
-}
+      if (syncStateError) {
+        throw new Error(
+          `Erro ao consultar progresso de ${modalidade.nome}: ${syncStateError.message}`
+        );
+      }
 
-let paginaInicial =
-  syncState?.proxima_pagina ?? 1;
+      /*
+       * Primeiro fazemos uma consulta à página 1.
+       *
+       * O objetivo principal aqui é descobrir
+       * quantas páginas existem AGORA.
+       *
+       * Isso é importante porque novas licitações
+       * podem aumentar o número total de páginas.
+       */
+      const primeiraConsulta =
+        await fetchComprasPage({
+          page: 1,
+          startDate,
+          endDate,
+          codigoModalidade:
+            modalidade.codigo,
+        });
 
-if (paginaInicial < 1) {
-  paginaInicial = 1;
-}
+      totalRegistros =
+        primeiraConsulta.totalRegistros ?? 0;
 
-let ultimaPaginaProcessada =
-  paginaInicial - 1;
+      totalPaginas =
+        primeiraConsulta.totalPaginas ?? 0;
 
+      /*
+       * Se ainda não há registros para essa
+       * modalidade, apenas registramos o estado.
+       */
+      if (totalPaginas < 1) {
+        const {
+          error: emptyStateError,
+        } = await supabase
+          .from('licitacoes_sync_state')
+          .upsert(
+            {
+              modalidade_codigo:
+                modalidade.codigo,
+
+              proxima_pagina: 0,
+
+              total_paginas: 0,
+
+              updated_at:
+                new Date().toISOString(),
+            },
+            {
+              onConflict:
+                'modalidade_codigo',
+            }
+          );
+
+        if (emptyStateError) {
+          errors.push(
+            `${modalidade.nome}: não foi possível salvar o progresso: ${emptyStateError.message}`
+          );
+        }
+
+        resumoModalidades.push({
+          codigo:
+            modalidade.codigo,
+
+          modalidade:
+            modalidade.nome,
+
+          totalRegistros,
+
+          totalPaginas,
+
+          paginaInicial: 0,
+
+          proximaPagina: 0,
+
+          paginasProcessadas: 0,
+
+          registrosRecebidos: 0,
+
+          registrosSalvos: 0,
+        });
+
+        continue;
+      }
+
+      /*
+       * Se não existe progresso válido, começamos
+       * pela última página, que contém os registros
+       * mais recentes.
+       *
+       * Se existe progresso, continuamos dali.
+       *
+       * Também protegemos contra um número de página
+       * maior que o total atual.
+       */
+      let paginaInicial =
+        syncState?.proxima_pagina ?? 0;
+
+      if (
+        paginaInicial < 1 ||
+        paginaInicial > totalPaginas
+      ) {
+        paginaInicial =
+          totalPaginas;
+      }
+
+      const paginaInicialDoLote =
+        paginaInicial;
+
+      /*
+       * Exemplo:
+       *
+       * paginaInicial = 40
+       * MAX = 5
+       *
+       * Processaremos:
+       * 40, 39, 38, 37 e 36.
+       */
       const paginaFinalDoLote =
-  paginaInicial +
-  MAX_PAGES_PER_MODALIDADE -
-  1;
+        Math.max(
+          1,
+          paginaInicial -
+            MAX_PAGES_PER_MODALIDADE +
+            1
+        );
 
-for (
-  let page = paginaInicial;
-  page <= paginaFinalDoLote;
-  page += 1
-) {
+      let ultimaPaginaProcessada =
+        paginaInicial + 1;
+
+      for (
+        let page = paginaInicial;
+        page >= paginaFinalDoLote;
+        page -= 1
+      ) {
         try {
           const compras =
             await fetchComprasPage({
@@ -253,20 +374,8 @@ for (
           pagesProcessed += 1;
           paginasModalidade += 1;
 
-          /*
- * A API informa o total em qualquer página.
- * Isso é necessário porque agora nem sempre
- * começamos pela página 1.
- */
-if (totalPaginas === 0) {
-  totalRegistros =
-    compras.totalRegistros ?? 0;
-
-  totalPaginas =
-    compras.totalPaginas ?? 0;
-}
-
-ultimaPaginaProcessada = page;
+          ultimaPaginaProcessada =
+            page;
 
           const items =
             compras.resultado ?? [];
@@ -278,7 +387,7 @@ ultimaPaginaProcessada = page;
             items.length;
 
           if (!items.length) {
-            break;
+            continue;
           }
 
           const now =
@@ -374,14 +483,29 @@ ultimaPaginaProcessada = page;
             continue;
           }
 
+          /*
+           * Proteção contra eventuais duplicidades
+           * dentro da mesma resposta da API.
+           */
+          const uniqueRows =
+            Array.from(
+              new Map(
+                rows.map((row) => [
+                  row.pncp_id,
+                  row,
+                ])
+              ).values()
+            );
+
           const {
             error: upsertError,
           } = await supabase
             .from('licitacoes')
             .upsert(
-              rows,
+              uniqueRows,
               {
-                onConflict: 'pncp_id',
+                onConflict:
+                  'pncp_id',
               }
             );
 
@@ -399,21 +523,10 @@ ultimaPaginaProcessada = page;
           }
 
           recordsSaved +=
-            rows.length;
+            uniqueRows.length;
 
           salvosModalidade +=
-            rows.length;
-
-          /*
-           * Se a API tiver menos páginas
-           * que nosso limite, paramos.
-           */
-          if (
-            totalPaginas > 0 &&
-            page >= totalPaginas
-          ) {
-            break;
-          }
+            uniqueRows.length;
         } catch (error) {
           const message =
             error instanceof Error
@@ -430,60 +543,62 @@ ultimaPaginaProcessada = page;
           );
 
           /*
-           * Não derrubamos toda a sincronização
-           * porque uma página ou modalidade falhou.
+           * Interrompemos somente esta modalidade.
            */
           break;
         }
       }
 
-/*
- * Define de onde a próxima execução
- * continuará.
- *
- * Se chegamos ao final, reiniciamos
- * na página 1 para atualizar o índice
- * com novas publicações.
- */
-let proximaPagina =
-  ultimaPaginaProcessada + 1;
+      /*
+       * Como percorremos de trás para frente,
+       * continuamos na página anterior à última
+       * processada.
+       */
+      let proximaPagina =
+        ultimaPaginaProcessada - 1;
 
-if (
-  totalPaginas > 0 &&
-  proximaPagina > totalPaginas
-) {
-  proximaPagina = 1;
-}
+      /*
+       * Quando chegarmos ao começo do período,
+       * salvamos 0.
+       *
+       * Na próxima execução, 0 fará o sistema
+       * voltar automaticamente para a última
+       * página disponível, atualizando primeiro
+       * as publicações mais recentes.
+       */
+      if (proximaPagina < 1) {
+        proximaPagina = 0;
+      }
 
-const {
-  error: updateStateError,
-} = await supabase
-  .from('licitacoes_sync_state')
-  .upsert(
-    {
-      modalidade_codigo:
-        modalidade.codigo,
+      const {
+        error: updateStateError,
+      } = await supabase
+        .from('licitacoes_sync_state')
+        .upsert(
+          {
+            modalidade_codigo:
+              modalidade.codigo,
 
-      proxima_pagina:
-        proximaPagina,
+            proxima_pagina:
+              proximaPagina,
 
-      total_paginas:
-        totalPaginas || null,
+            total_paginas:
+              totalPaginas,
 
-      updated_at:
-        new Date().toISOString(),
-    },
-    {
-      onConflict:
-        'modalidade_codigo',
-    }
-  );
+            updated_at:
+              new Date().toISOString(),
+          },
+          {
+            onConflict:
+              'modalidade_codigo',
+          }
+        );
 
-if (updateStateError) {
-  errors.push(
-    `${modalidade.nome}: não foi possível salvar o progresso: ${updateStateError.message}`
-  );
-}
+      if (updateStateError) {
+        errors.push(
+          `${modalidade.nome}: não foi possível salvar o progresso: ${updateStateError.message}`
+        );
+      }
 
       resumoModalidades.push({
         codigo:
@@ -495,6 +610,11 @@ if (updateStateError) {
         totalRegistros,
 
         totalPaginas,
+
+        paginaInicial:
+          paginaInicialDoLote,
+
+        proximaPagina,
 
         paginasProcessadas:
           paginasModalidade,
@@ -514,9 +634,15 @@ if (updateStateError) {
       source:
         'Compras.gov.br / PNCP',
 
+      estrategia:
+        'mais_recentes_primeiro',
+
       periodo: {
-        inicio: startDate,
-        fim: endDate,
+        inicio:
+          startDate,
+
+        fim:
+          endDate,
       },
 
       modalidades:
@@ -551,6 +677,7 @@ if (updateStateError) {
     );
   }
 }
+
 export async function POST() {
   return runSync();
 }
