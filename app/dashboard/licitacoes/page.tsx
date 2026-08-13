@@ -20,18 +20,33 @@ import {
 } from '@/components/ui/card';
 
 export default function LicitacoesPage() {
-    type Licitacao = {
-    id: string;
-    pncpId: string | null;
-    objeto: string;
-    orgao: string;
-    uf: string | null;
-    municipio: string | null;
-    modalidade: string;
-    valor: number | null;
-    encerramento: string | null;
-    fonte: string;
-  };
+    type ItemEncontrado = {
+  id: string;
+  numero: number | null;
+  descricao: string;
+  descricaoDetalhada: string | null;
+  quantidade: number | null;
+  unidade: string | null;
+  valorUnitario: number | null;
+  valorTotal: number | null;
+  situacao: string | null;
+};
+
+type Licitacao = {
+  id: string;
+  pncpId: string | null;
+  objeto: string;
+  orgao: string;
+  uf: string | null;
+  municipio: string | null;
+  modalidade: string;
+  valor: number | null;
+  encerramento: string | null;
+  fonte: string;
+
+  encontradoNosItens?: boolean;
+  itensEncontrados?: ItemEncontrado[];
+};
 
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Licitacao[]>([]);
@@ -45,6 +60,8 @@ const [valorMin, setValorMin] = useState('');
 const [valorMax, setValorMax] = useState('');
 const [excluir, setExcluir] = useState('');
 const [somenteAbertas, setSomenteAbertas] = useState(true);
+const [licitacoesExpandidas, setLicitacoesExpandidas] =
+  useState<Set<string>>(new Set());
 
 async function handleSearch() {
   if (!query.trim()) {
@@ -446,6 +463,124 @@ onKeyDown={(event) => {
                 <p className="line-clamp-3 text-sm font-medium text-foreground">
                   {licitacao.objeto}
                 </p>
+
+{licitacao.itensEncontrados &&
+  licitacao.itensEncontrados.length > 0 && (() => {
+    const expandida =
+      licitacoesExpandidas.has(licitacao.id);
+
+    const itensVisiveis = expandida
+      ? licitacao.itensEncontrados
+      : licitacao.itensEncontrados.slice(0, 3);
+
+    return (
+      <div className="mt-3 space-y-2">
+        <div className="flex items-center gap-2">
+          <span className="rounded-full bg-primary/10 px-2 py-1 text-xs font-semibold text-primary">
+            {licitacao.itensEncontrados.length}{' '}
+            {licitacao.itensEncontrados.length === 1
+              ? 'item encontrado'
+              : 'itens encontrados'}
+          </span>
+        </div>
+
+        {itensVisiveis.map((item) => (
+          <div
+            key={item.id}
+            className="rounded-lg border bg-background p-3"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              {item.numero !== null && (
+                <span className="text-xs font-semibold text-foreground">
+                  Item {item.numero}
+                </span>
+              )}
+
+              {item.situacao && (
+                <span className="text-xs text-muted-foreground">
+                  • {item.situacao}
+                </span>
+              )}
+            </div>
+
+            <p className="mt-1 line-clamp-3 text-xs leading-5 text-muted-foreground">
+              {item.descricao}
+            </p>
+
+            <div className="mt-2 grid grid-cols-1 gap-2 text-xs sm:grid-cols-3">
+              <div>
+                <span className="text-muted-foreground">
+                  Quantidade
+                </span>
+
+                <p className="font-semibold text-foreground">
+                  {item.quantidade !== null
+                    ? `${item.quantidade.toLocaleString('pt-BR')} ${
+                        item.unidade ?? ''
+                      }`
+                    : 'Não informada'}
+                </p>
+              </div>
+
+              <div>
+                <span className="text-muted-foreground">
+                  Unitário
+                </span>
+
+                <p className="font-semibold text-foreground">
+                  {item.valorUnitario !== null
+                    ? item.valorUnitario.toLocaleString('pt-BR', {
+                        style: 'currency',
+                        currency: 'BRL',
+                      })
+                    : 'Não informado'}
+                </p>
+              </div>
+
+              <div>
+                <span className="text-muted-foreground">
+                  Total
+                </span>
+
+                <p className="font-semibold text-foreground">
+                  {item.valorTotal !== null
+                    ? item.valorTotal.toLocaleString('pt-BR', {
+                        style: 'currency',
+                        currency: 'BRL',
+                      })
+                    : 'Não informado'}
+                </p>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {licitacao.itensEncontrados.length > 3 && (
+          <button
+            type="button"
+            onClick={() => {
+              setLicitacoesExpandidas((anteriores) => {
+                const novos = new Set(anteriores);
+
+                if (novos.has(licitacao.id)) {
+                  novos.delete(licitacao.id);
+                } else {
+                  novos.add(licitacao.id);
+                }
+
+                return novos;
+              });
+            }}
+            className="text-xs font-semibold text-primary hover:underline"
+          >
+            {expandida
+              ? 'Mostrar menos'
+              : `Ver todos os ${licitacao.itensEncontrados.length} itens`}
+          </button>
+        )}
+      </div>
+    );
+  })()}
 
                 <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                   <span>

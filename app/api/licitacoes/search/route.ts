@@ -95,15 +95,26 @@ const excluir =
      * não aparece no objeto geral.
      */
     const {
-      data: itemMatches,
-      error: itemError,
-    } = await supabase
-      .from('licitacao_itens')
-      .select('pncp_id')
-      .or(
-        `descricao.ilike.%${safeQuery}%,descricao_detalhada.ilike.%${safeQuery}%`
-      )
-      .limit(MAX_ITEM_MATCHES);
+  data: itemMatches,
+  error: itemError,
+} = await supabase
+  .from('licitacao_itens')
+  .select(`
+    pncp_id,
+    item_id,
+    numero_item,
+    descricao,
+    descricao_detalhada,
+    quantidade,
+    unidade_medida,
+    valor_unitario_estimado,
+    valor_total_estimado,
+    situacao
+  `)
+  .or(
+    `descricao.ilike.%${safeQuery}%,descricao_detalhada.ilike.%${safeQuery}%`
+  )
+  .limit(MAX_ITEM_MATCHES);
 
     if (itemError) {
       console.error(
@@ -474,6 +485,27 @@ if (excluir) {
     const itemPncpSet =
       new Set(itemPncpIds);
 
+const itensPorPncp = new Map<
+  string,
+  typeof itemMatches
+>();
+
+for (const match of itemMatches ?? []) {
+  if (!match.pncp_id) {
+    continue;
+  }
+
+  const atuais =
+    itensPorPncp.get(match.pncp_id) ?? [];
+
+  atuais.push(match);
+
+  itensPorPncp.set(
+    match.pncp_id,
+    atuais
+  );
+}
+
     const results =
       rows.map((item) => ({
         id:
@@ -525,6 +557,37 @@ if (excluir) {
           itemPncpSet.has(
             item.pncp_id
           ),
+        itensEncontrados:
+  (itensPorPncp.get(item.pncp_id) ?? [])
+    .map((match) => ({
+      id: match.item_id,
+
+      numero:
+        match.numero_item,
+
+      descricao:
+        match.descricao ||
+        match.descricao_detalhada ||
+        'Descrição não informada',
+
+      descricaoDetalhada:
+        match.descricao_detalhada,
+
+      quantidade:
+        match.quantidade,
+
+      unidade:
+        match.unidade_medida,
+
+      valorUnitario:
+        match.valor_unitario_estimado,
+
+      valorTotal:
+        match.valor_total_estimado,
+
+      situacao:
+        match.situacao,
+    })),  
       }));
 
     return NextResponse.json({
