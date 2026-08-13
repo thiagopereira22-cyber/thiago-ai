@@ -588,13 +588,21 @@ onKeyDown={(event) => {
                   </span>
 
                   {licitacao.pncpId ? (
-                    <>
-                      <span>•</span>
-                      <span>
-                        {licitacao.pncpId}
-                      </span>
-                    </>
-                  ) : null}
+  <>
+    <span>•</span>
+
+    <a
+      href={`https://pncp.gov.br/app/editais?pagina=1&q=${encodeURIComponent(
+        licitacao.pncpId
+      )}&status=todos`}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="font-medium text-primary hover:underline"
+    >
+      Ver oportunidade ↗
+    </a>
+  </>
+) : null}
                 </div>
               </div>
 
