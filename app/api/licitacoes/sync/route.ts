@@ -313,262 +313,306 @@ async function runSync() {
       }
 
       /*
-       * Se não existe progresso válido, começamos
-       * pela última página, que contém os registros
-       * mais recentes.
-       *
-       * Se existe progresso, continuamos dali.
-       *
-       * Também protegemos contra um número de página
-       * maior que o total atual.
-       */
-      let paginaInicial =
-        syncState?.proxima_pagina ?? 0;
+ * ESTRATÉGIA:
+ *
+ * Em toda execução processamos:
+ *
+ * 1. As 2 páginas mais recentes.
+ * 2. Até 3 páginas do histórico.
+ *
+ * Assim novas oportunidades entram rapidamente
+ * no Radar sem interromper o preenchimento
+ * progressivo do histórico.
+ */
 
-      if (
-        paginaInicial < 1 ||
-        paginaInicial > totalPaginas
-      ) {
-        paginaInicial =
-          totalPaginas;
-      }
+const PAGINAS_RECENTES = 2;
 
-      const paginaInicialDoLote =
-        paginaInicial;
+const PAGINAS_HISTORICO =
+  Math.max(
+    0,
+    MAX_PAGES_PER_MODALIDADE -
+      PAGINAS_RECENTES
+  );
 
-      /*
-       * Exemplo:
-       *
-       * paginaInicial = 40
-       * MAX = 5
-       *
-       * Processaremos:
-       * 40, 39, 38, 37 e 36.
-       */
-      const paginaFinalDoLote =
-        Math.max(
-          1,
-          paginaInicial -
-            MAX_PAGES_PER_MODALIDADE +
-            1
-        );
+/*
+ * Páginas mais recentes.
+ *
+ * Exemplo:
+ * totalPaginas = 31
+ *
+ * recentes = [31, 30]
+ */
+const paginasRecentes: number[] = [];
 
-      let ultimaPaginaProcessada =
-        paginaInicial + 1;
+for (
+  let page = totalPaginas;
+  page >=
+    Math.max(
+      1,
+      totalPaginas -
+        PAGINAS_RECENTES +
+        1
+    );
+  page -= 1
+) {
+  paginasRecentes.push(page);
+}
 
-      for (
-        let page = paginaInicial;
-        page >= paginaFinalDoLote;
-        page -= 1
-      ) {
-        try {
-          const compras =
-            await fetchComprasPage({
-              page,
-              startDate,
-              endDate,
-              codigoModalidade:
-                modalidade.codigo,
-            });
+/*
+ * Recuperamos o cursor histórico.
+ *
+ * Se ainda não existe um cursor válido,
+ * começamos logo antes das páginas recentes.
+ */
+let paginaHistorico =
+  syncState?.proxima_pagina ?? 0;
 
-          pagesProcessed += 1;
-          paginasModalidade += 1;
+if (
+  paginaHistorico < 1 ||
+  paginaHistorico >=
+    totalPaginas -
+      PAGINAS_RECENTES +
+      1
+) {
+  paginaHistorico =
+    totalPaginas -
+    PAGINAS_RECENTES;
+}
 
-          ultimaPaginaProcessada =
-            page;
+/*
+ * Montamos as páginas históricas.
+ *
+ * Evitamos repetir páginas que já pertencem
+ * ao bloco das páginas recentes.
+ */
+const paginasHistorico: number[] = [];
 
-          const items =
-            compras.resultado ?? [];
+let cursorHistorico =
+  paginaHistorico;
 
-          recordsReceived +=
-            items.length;
+while (
+  cursorHistorico >= 1 &&
+  paginasHistorico.length <
+    PAGINAS_HISTORICO
+) {
+  if (
+    !paginasRecentes.includes(
+      cursorHistorico
+    )
+  ) {
+    paginasHistorico.push(
+      cursorHistorico
+    );
+  }
 
-          recebidosModalidade +=
-            items.length;
+  cursorHistorico -= 1;
+}
 
-          if (!items.length) {
-            continue;
-          }
+/*
+ * Juntamos recentes + histórico sem duplicidade.
+ */
+const paginasParaProcessar =
+  Array.from(
+    new Set([
+      ...paginasRecentes,
+      ...paginasHistorico,
+    ])
+  );
 
-          const now =
-            new Date().toISOString();
+const paginaInicialDoLote =
+  paginasParaProcessar[0] ?? 0;
 
-          const rows = items
-            .filter((item) => {
-              if (
-                !item.numeroControlePNCP
-              ) {
-                recordsIgnored += 1;
+for (const page of paginasParaProcessar) {
+  try {
+    const compras =
+      await fetchComprasPage({
+        page,
+        startDate,
+        endDate,
+        codigoModalidade:
+          modalidade.codigo,
+      });
 
-                return false;
-              }
+    pagesProcessed += 1;
+    paginasModalidade += 1;
 
-              return true;
-            })
-            .map((item) => ({
-              pncp_id:
-                item.numeroControlePNCP!,
+    const items =
+      compras.resultado ?? [];
 
-              objeto:
-                item.objetoCompra ||
-                'Objeto não informado',
+    recordsReceived +=
+      items.length;
 
-              orgao:
-                item.orgaoEntidadeRazaoSocial ||
-                item.unidadeOrgaoNomeUnidade ||
-                null,
+    recebidosModalidade +=
+      items.length;
 
-              cnpj_orgao:
-                item.orgaoEntidadeCnpj ||
-                null,
+    if (!items.length) {
+      continue;
+    }
 
-              uf:
-                item.unidadeOrgaoUfSigla ||
-                null,
+    const now =
+      new Date().toISOString();
 
-              municipio:
-                item.unidadeOrgaoMunicipioNome ||
-                null,
+    const rows = items
+      .filter((item) => {
+        if (
+          !item.numeroControlePNCP
+        ) {
+          recordsIgnored += 1;
 
-              modalidade:
-                item.modalidadeNome ||
-                modalidade.nome,
-
-              modalidade_codigo:
-                item.modalidadeIdPncp ??
-                null,
-
-              valor_estimado:
-                item.valorTotalEstimado ??
-                null,
-
-              data_publicacao:
-                item.dataPublicacaoPncp ||
-                null,
-
-              data_abertura_proposta:
-                item.dataAberturaPropostaPncp ||
-                null,
-
-              data_encerramento_proposta:
-                item.dataEncerramentoPropostaPncp ||
-                null,
-
-              situacao:
-                item.situacaoCompraNomePncp ||
-                'Divulgada no PNCP',
-
-              ano_compra:
-                item.anoCompraPncp ??
-                null,
-
-              sequencial_compra:
-                item.sequencialCompraPncp ??
-                null,
-
-              fonte:
-                'Compras.gov.br / PNCP',
-
-              dados_originais:
-                item,
-
-              sincronizado_em:
-                now,
-
-              updated_at:
-                now,
-            }));
-
-          if (!rows.length) {
-            continue;
-          }
-
-          /*
-           * Proteção contra eventuais duplicidades
-           * dentro da mesma resposta da API.
-           */
-          const uniqueRows =
-            Array.from(
-              new Map(
-                rows.map((row) => [
-                  row.pncp_id,
-                  row,
-                ])
-              ).values()
-            );
-
-          const {
-            error: upsertError,
-          } = await supabase
-            .from('licitacoes')
-            .upsert(
-              uniqueRows,
-              {
-                onConflict:
-                  'pncp_id',
-              }
-            );
-
-          if (upsertError) {
-            console.error(
-              `Erro Supabase - ${modalidade.nome} - página ${page}:`,
-              upsertError
-            );
-
-            errors.push(
-              `${modalidade.nome}, página ${page}: ${upsertError.message}`
-            );
-
-            continue;
-          }
-
-          recordsSaved +=
-            uniqueRows.length;
-
-          salvosModalidade +=
-            uniqueRows.length;
-        } catch (error) {
-          const message =
-            error instanceof Error
-              ? error.message
-              : 'Erro desconhecido';
-
-          console.error(
-            `${modalidade.nome} - página ${page}:`,
-            error
-          );
-
-          errors.push(
-            `${modalidade.nome}, página ${page}: ${message}`
-          );
-
-          /*
-           * Interrompemos somente esta modalidade.
-           */
-          break;
+          return false;
         }
-      }
 
-      /*
-       * Como percorremos de trás para frente,
-       * continuamos na página anterior à última
-       * processada.
-       */
-      let proximaPagina =
-        ultimaPaginaProcessada - 1;
+        return true;
+      })
+      .map((item) => ({
+        pncp_id:
+          item.numeroControlePNCP!,
 
-      /*
-       * Quando chegarmos ao começo do período,
-       * salvamos 0.
-       *
-       * Na próxima execução, 0 fará o sistema
-       * voltar automaticamente para a última
-       * página disponível, atualizando primeiro
-       * as publicações mais recentes.
-       */
-      if (proximaPagina < 1) {
-        proximaPagina = 0;
-      }
+        objeto:
+          item.objetoCompra ||
+          'Objeto não informado',
+
+        orgao:
+          item.orgaoEntidadeRazaoSocial ||
+          item.unidadeOrgaoNomeUnidade ||
+          null,
+
+        cnpj_orgao:
+          item.orgaoEntidadeCnpj ||
+          null,
+
+        uf:
+          item.unidadeOrgaoUfSigla ||
+          null,
+
+        municipio:
+          item.unidadeOrgaoMunicipioNome ||
+          null,
+
+        modalidade:
+          item.modalidadeNome ||
+          modalidade.nome,
+
+        modalidade_codigo:
+          item.modalidadeIdPncp ??
+          null,
+
+        valor_estimado:
+          item.valorTotalEstimado ??
+          null,
+
+        data_publicacao:
+          item.dataPublicacaoPncp ||
+          null,
+
+        data_abertura_proposta:
+          item.dataAberturaPropostaPncp ||
+          null,
+
+        data_encerramento_proposta:
+          item.dataEncerramentoPropostaPncp ||
+          null,
+
+        situacao:
+          item.situacaoCompraNomePncp ||
+          'Divulgada no PNCP',
+
+        ano_compra:
+          item.anoCompraPncp ??
+          null,
+
+        sequencial_compra:
+          item.sequencialCompraPncp ??
+          null,
+
+        fonte:
+          'Compras.gov.br / PNCP',
+
+        dados_originais:
+          item,
+
+        sincronizado_em:
+          now,
+
+        updated_at:
+          now,
+      }));
+
+    if (!rows.length) {
+      continue;
+    }
+
+    const uniqueRows =
+      Array.from(
+        new Map(
+          rows.map((row) => [
+            row.pncp_id,
+            row,
+          ])
+        ).values()
+      );
+
+    const {
+      error: upsertError,
+    } = await supabase
+      .from('licitacoes')
+      .upsert(
+        uniqueRows,
+        {
+          onConflict:
+            'pncp_id',
+        }
+      );
+
+    if (upsertError) {
+      console.error(
+        `Erro Supabase - ${modalidade.nome} - página ${page}:`,
+        upsertError
+      );
+
+      errors.push(
+        `${modalidade.nome}, página ${page}: ${upsertError.message}`
+      );
+
+      continue;
+    }
+
+    recordsSaved +=
+      uniqueRows.length;
+
+    salvosModalidade +=
+      uniqueRows.length;
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : 'Erro desconhecido';
+
+    console.error(
+      `${modalidade.nome} - página ${page}:`,
+      error
+    );
+
+    errors.push(
+      `${modalidade.nome}, página ${page}: ${message}`
+    );
+  }
+}
+
+/*
+ * O próximo cursor continua de onde
+ * terminamos no histórico.
+ *
+ * Quando chegarmos ao início, usamos 0.
+ * Na execução seguinte o histórico
+ * recomeçará logo abaixo das páginas recentes.
+ */
+let proximaPagina =
+  cursorHistorico;
+
+if (proximaPagina < 1) {
+  proximaPagina = 0;
+}
 
       const {
         error: updateStateError,
@@ -635,7 +679,7 @@ async function runSync() {
         'Compras.gov.br / PNCP',
 
       estrategia:
-        'mais_recentes_primeiro',
+  'recentes_mais_historico',
 
       periodo: {
         inicio:
